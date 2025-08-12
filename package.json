@@ -1,0 +1,27 @@
+{
+  "name": "lidl-extender",
+  "version": "1.1.1",
+  "description": "Eine nachbuchungsmöglichkeit für Lidl Connects Unlimited on Demand",
+  "main": "script.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/user871258938/lidl"
+  },
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "GNU Public License v3.0",
+  "bugs": {
+    "url": "https://github.com/user871258938/lidl/issues"
+  },
+  "homepage": "https://github.com/user871258938/lidl#readme",
+  "dependencies": {
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
+    "logging": "^4.2.0",
+    "playwright": "^1.54.2"
+  }
+}
