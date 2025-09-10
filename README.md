@@ -83,10 +83,14 @@ node script.js
 Das Skript meldet sich automatisch bei deinem Lidl-Connect-Konto an, ruft die aktuellen Verbrauchsdaten ab und sendet Benachrichtigungen entsprechend deiner Konfiguration.
 Es pausiert danach für die eingestellte Zeit und wiederholt den Vorgang.
 
-Für eine längere Nutzung empfiehlt sich ein Tool wie nohup
+Für eine längere Nutzung empfiehlt sich ein Tool wie nohup oder Docker
 
 ```bash
 nohup node script.js &
+```
+
+```bash
+docker build -t lidl-extender . && docker run -d --name lidl-extender --hostname lidl-extender --restart unless-stopped lidl-extender
 ```
 
 ---
