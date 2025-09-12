@@ -47,8 +47,8 @@ Dieses Projekt löst das Problem, den Datenverbrauch manuell überprüfen zu mü
 1. Repository klonen:
 
     ```bash
-    git clone https://github.com/nino678190/lidl-extender
-    cd lidl-extender
+    git clone https://github.com/user871258938/lidl
+    cd lidl
     ```
 
 2. Abhängigkeiten installieren:
