@@ -30,12 +30,12 @@ const infoLevel = process.env.INFO_LEVEL || "info";
 // URLs
 const telegramApiUrl = `https://api.telegram.org/bot${telegramToken}/sendMessage`;
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
-const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
-const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
-
-const version = "1.2.0";
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
+
+const version = "1.2.0";
+const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
+const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/139.0";
 const delay = ms => new Promise(res => setTimeout(res, ms));
