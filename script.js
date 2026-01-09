@@ -33,7 +33,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.0";
+const version = "1.2.1";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -213,11 +213,11 @@ async function validateSession() {
             }
 
             await page.waitForSelector(".app-consumptions .progress-wrapper label.unit-display", { timeout: 10000 });
-            logger.info("Session-Validierung erfolgreich");
-            lastActivityTime = Date.now();
-            saveSessionMeta();
-            return true;
-        })();
+			logger.info("Session-Validierung erfolgreich");
+			lastActivityTime = Date.now();
+			saveSessionMeta();
+			return true;
+		})();
 
         return await Promise.race([
             validationPromise,
@@ -403,15 +403,15 @@ async function performLogin() {
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
-            await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
+			await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
 			await page.waitForSelector('input[name="password"]', { timeout: 15000 });
-
-            // Felder leeren und ausfüllen
-            await page.fill('input[name="msisdn"]', '');
+			
+			// Felder leeren und ausfüllen
+			await page.fill('input[name="msisdn"]', '');
 			await page.fill('input[name="password"]', '');
             await delay(1000);
 
-            await page.fill('input[name="msisdn"]', rufnummer);
+			await page.fill('input[name="msisdn"]', rufnummer);
             await page.fill('input[name="password"]', passwort);
 
             logger.info("Login-Daten eingegeben, sende Formular...");
@@ -510,50 +510,59 @@ async function main() {
                 await delay(2000);
             }
 
-            // Datenvolumen auslesen
-            const usage = await page.$eval('.consumption-info', el => {
-                const unitEl = el.querySelector('span.unit');
-                const unit = unitEl ? unitEl.textContent.trim() : '';
-                const nums = (el.textContent.match(/(\d+(?:[.,]\d+)?)/g) || []).map(n => parseFloat(n.replace(',', '.')));
-                const used = nums[0] ?? NaN;
-                const total = nums[1] ?? NaN;
-                return { used, total, unit };
-            });
+			// Datenvolumen auslesen (Tarif + Refill)
+			const usage = await page.evaluate(() => {
+				const result = {
+					tarif: { available: NaN, total: NaN, unit: '' },
+					refill: { available: NaN, total: NaN, unit: '' }
+				};
 
-            const used = usage.used;
-            let total = usage.total;
-            let datenVerfuegbar = (isNaN(total) || isNaN(used)) ? NaN : +(total - used).toFixed(3);
+				// Get Tarif data (DATA id)
+				const tarifLabel = document.querySelector('label[for="DATA"].unit-display');
+				if (tarifLabel) {
+					const text = tarifLabel.textContent.trim();
+					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+					result.tarif.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+					result.tarif.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+					const unitEl = tarifLabel.querySelector('span.unit');
+					result.tarif.unit = unitEl ? unitEl.textContent.trim() : '';
+				}
 
-            // Refill-Daten prüfen
-            let refill = null;
-            try {
-                refill = await page.$eval('.refill-wrapper > .consumption-info', el => {
-                    const unitEl = el.querySelector('span.unit');
-                    const unit = unitEl ? unitEl.textContent.trim() : '';
-                    const nums = (el.textContent.match(/(\d+(?:[.,]\d+)?)/g) || []).map(n => parseFloat(n.replace(',', '.')));
-                    const used = nums[0] ?? NaN;
-                    const total = nums[1] ?? NaN;
-                    return { used, total, unit };
-                });
-            } catch (e) {
-                logger.warn("Refill-Block nicht gefunden");
-            }
+				// Get Refill data (REFILLABLE_DATA id) - optional, may not always be present
+				const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
+				if (refillLabel) {
+					const text = refillLabel.textContent.trim();
+					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+					result.refill.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+					result.refill.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+					const unitEl = refillLabel.querySelector('span.unit');
+					result.refill.unit = unitEl ? unitEl.textContent.trim() : '';
+				}
 
-            if (refill && !isNaN(refill.used) && !isNaN(refill.total)) {
-                const refillUsed = refill.used;
-                const refillTotal = refill.total;
-                const refillVerfuegbar = +(refillTotal - refillUsed).toFixed(3);
-                datenVerfuegbar = isNaN(datenVerfuegbar)
-                    ? refillVerfuegbar
-                    : +(datenVerfuegbar + refillVerfuegbar).toFixed(3);
-            }
+				return result;
+			});
+			
+			const datenVerfuegbar = usage.tarif.available;
+			const refillVerfuegbar = usage.refill.available;
+
+			// Log both volumes
+			const tarifMessage = `📊 Tarif: ${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
+			let refillMessage = '';
+			
+			// Only log refill if it's available (has valid numbers)
+			if (!isNaN(refillVerfuegbar)) {
+				refillMessage = `📊 Refill: ${usage.refill.available} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+				logger.info(refillMessage);
+			}
+			
+			logger.info(tarifMessage);
 
             // Nachbuchung falls nötig
             let nachbuchungsErfolg = false;
             if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1) {
                 try {
                     logger.info("Wenig Datenvolumen, versuche Nachbuchung...");
-                    await page.click(".tariff-btn-176", { timeout: 10000 });
+                    await page.click('a[href*="tarife-und-optionen.html#bookableOptionsOverview"]', { timeout: 10000 });
                     await delay(7000);
                     const successSelector = ".alert";
                     if (await page.$(successSelector)) {
@@ -571,13 +580,20 @@ async function main() {
             if (datenVerfuegbar < 1 && !nachbuchungsErfolg) {
                 sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
             } else if (datenVerfuegbar < 1 && nachbuchungsErfolg) {
-                sendMessage(`✅ Nachbuchung erfolgreich! Verfügbares Datenvolumen: ${datenVerfuegbar + 1} GB`, "info");
+                let statusMessage = `✅ Nachbuchung erfolgreich!\n${tarifMessage}`;
+                if (refillMessage) statusMessage += `\n${refillMessage}`;
+                sendMessage(statusMessage, "info");
                 datenVerfuegbar += 1;
             }
 
             datenVolumen = datenVerfuegbar;
             lastActivityTime = Date.now();
             saveSessionMeta();
+
+            // Send status update with volumes
+            let finalStatusMessage = tarifMessage;
+            if (refillMessage) finalStatusMessage += `\n${refillMessage}`;
+            sendMessage(finalStatusMessage, "info");
 
             return datenVolumen;
         });
