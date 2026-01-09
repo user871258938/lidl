@@ -316,19 +316,19 @@ async function initializeBrowser() {
 
         const userDataDir = './lidl-extender-data';
 
-        // Bereinige alte Browser-Daten bei wiederholten Fehlern
-        if (consecutiveErrors >= 2) {
-            logger.info("Bereinige Browser-Daten aufgrund von Fehlern...");
-            try {
-                if (fs.existsSync(userDataDir)) {
-                    fs.rmSync(userDataDir, { recursive: true, force: true });
-                }
-                if (fs.existsSync(cookiefile)) {
-                    fs.unlinkSync(cookiefile);
-                }
-            } catch (cleanupError) {
-                logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
+        // Lösche Browser-Daten immer beim Start für frischen Login
+        logger.info("Lösche Browser-Daten für frischen Login...");
+        try {
+            if (fs.existsSync(userDataDir)) {
+                fs.rmSync(userDataDir, { recursive: true, force: true });
+                logger.info("userDataDir gelöscht");
             }
+            if (fs.existsSync(cookiefile)) {
+                fs.unlinkSync(cookiefile);
+                logger.info("cookies.json gelöscht");
+            }
+        } catch (cleanupError) {
+            logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
         }
 
         const browserOptions = {
@@ -476,32 +476,11 @@ async function main() {
                 }
             }
 
-            // Session-Gültigkeit prüfen
-            let sessionValid = false;
-
-            if (fs.existsSync(cookiefile) && !isSessionExpired()) {
-                logger.info("Prüfe bestehende Session...");
-                sessionValid = await validateSession();
-            }
-
-            // Login falls Session ungültig
-            if (!sessionValid) {
-                logger.info("Session ungültig oder abgelaufen, führe Login durch...");
-
-                // Lösche alte Session-Daten
-                if (fs.existsSync(cookiefile)) {
-                    fs.unlinkSync(cookiefile);
-                }
-                if (fs.existsSync(sessionMetaFile)) {
-                    fs.unlinkSync(sessionMetaFile);
-                }
-
-                const loginSuccess = await performLogin();
-                if (!loginSuccess) {
-                    throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
-                }
-            } else {
-                logger.info("Bestehende Session ist gültig");
+            // Login durchführen (Browser-Daten wurden bereits gelöscht bei initializeBrowser)
+            logger.info("Führe Login durch...");
+            const loginSuccess = await performLogin();
+            if (!loginSuccess) {
+                throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
             }
 
             // Stelle sicher, dass wir auf der Übersichtsseite sind
@@ -509,6 +488,19 @@ async function main() {
                 await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
                 await delay(2000);
             }
+
+            // Warte auf Datenvolumen-Element bevor wir extrahieren
+            try {
+                await page.waitForFunction(() => {
+                    const element = document.querySelector('label[for="DATA"].unit-display');
+                    return element && element.textContent.trim().length > 0;
+                }, { timeout: 15000 });
+                logger.debug("Datenvolumen-Element gefunden und bereit");
+            } catch (error) {
+                logger.warn(`Datenvolumen-Element nicht gefunden: ${error.message}`);
+            }
+
+            await delay(1000); // Zusätzliche kurze Wartezeit
 
 			// Datenvolumen auslesen (Tarif + Refill)
 			const usage = await page.evaluate(() => {
