@@ -1,8 +1,14 @@
 import createLogger from "logging";
 import * as playwright from "playwright";
 import axios from "axios";
+
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ path: new URL('./.env', import.meta.url).pathname });
+// .env geladen?
+if (!process.env.RUFNUMMER || !process.env.PASSWORD) {
+    throw new Error("ENV Fehler: RUFNUMMER oder PASSWORD fehlt oder ist leer");
+}
+
 import * as fs from "fs";
 import { exec } from "child_process";
 
