@@ -33,9 +33,9 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
 
-const version = "1.1.1";
-const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
-const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
+const version = "1.2.0";
+const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
+const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/139.0";
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -206,13 +206,13 @@ async function validateSession() {
             });
             await delay(2000);
 
-            const loginFormExists = await page.$('#__BVID__27') !== null;
+            const loginFormExists = await page.$('input[name="msisdn"]') !== null;
             if (loginFormExists) {
                 logger.warn("Login-Formular gefunden, Session ungültig");
                 return false;
             }
 
-            await page.waitForSelector(".consumption-info", { timeout: 10000 });
+            await page.waitForSelector(".app-consumptions .progress-wrapper label.unit-display", { timeout: 10000 });
             logger.info("Session-Validierung erfolgreich");
             lastActivityTime = Date.now();
             saveSessionMeta();
@@ -403,22 +403,22 @@ async function performLogin() {
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
-            await page.waitForSelector("#__BVID__27", { timeout: 15000 });
-            await page.waitForSelector("#__BVID__31", { timeout: 15000 });
+            await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
+			await page.waitForSelector('input[name="password"]', { timeout: 15000 });
 
             // Felder leeren und ausfüllen
-            await page.fill("#__BVID__27", "");
-            await page.fill("#__BVID__31", "");
+            await page.fill('input[name="msisdn"]', '');
+			await page.fill('input[name="password"]', '');
             await delay(1000);
 
-            await page.fill("#__BVID__27", rufnummer);
-            await page.fill("#__BVID__31", passwort);
+            await page.fill('input[name="msisdn"]', rufnummer);
+            await page.fill('input[name="password"]', passwort);
 
             logger.info("Login-Daten eingegeben, sende Formular...");
 
             // Login-Button klicken und auf Navigation warten
             await Promise.all([
-                page.click("#submit-16"),
+                page.click('button[type="submit"]:has-text("Einloggen")'),
                 page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 })
             ]);
 
