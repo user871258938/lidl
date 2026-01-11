@@ -11,6 +11,7 @@ if (!process.env.RUFNUMMER || !process.env.PASSWORD) {
 
 import * as fs from "fs";
 import { exec } from "child_process";
+import os from "os";
 
 const logger = createLogger("lidl-extender");
 
@@ -23,6 +24,8 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID;
 const telegramAllow = process.env.TELEGRAM_ALLOW === "true";
 const discordAllow = process.env.DISCORD_ALLOW === "true";
 const autoUpdate = process.env.AUTO_UPDATE === "true";
+const killExistingProcesses = process.env.KILL_EXISTING_PROCESSES === "true";
+const killScriptInstances = process.env.KILL_SCRIPT_INSTANCES === "true";
 const sleepmode = process.env.SLEEP_MODE;
 const sleepTime = parseInt(process.env.SLEEP_TIME, 10);
 const infoLevel = process.env.INFO_LEVEL || "info";
@@ -37,10 +40,52 @@ const version = "1.2.1";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/139.0";
 const delay = ms => new Promise(res => setTimeout(res, ms));
 const cookiefile = "cookies.json";
 const sessionMetaFile = "session_meta.json";
+
+// Browser-Fingerprint-Randomisierung (ohne locale/timezone)
+function generateFingerprint() {
+    // Firefox User-Agents mit verschiedenen Versionen
+    const firefoxVersions = [
+        { version: '139.0', geckoDate: '20100101' },
+        { version: '138.0', geckoDate: '20100101' },
+        { version: '137.0', geckoDate: '20100101' },
+        { version: '136.0', geckoDate: '20100101' },
+        { version: '135.0', geckoDate: '20100101' }
+    ];
+
+    // Windows-Versionen
+    const windowsVersions = ['10.0', '11.0'];
+
+    // Zufällige Bildschirmauflösungen
+    const screenResolutions = [
+        '1920x1080', '1366x768', '1440x900', '1600x900', '2560x1440',
+        '1920x1200', '2880x1800', '1280x720', '3440x1440'
+    ];
+
+    const randomVersion = firefoxVersions[Math.floor(Math.random() * firefoxVersions.length)];
+    const randomWindows = windowsVersions[Math.floor(Math.random() * windowsVersions.length)];
+
+    const userAgent = `Mozilla/5.0 (Windows NT ${randomWindows}; Win64; x64; rv:${randomVersion.version}) Gecko/${randomVersion.geckoDate} Firefox/${randomVersion.version}`;
+
+    const screenRes = screenResolutions[Math.floor(Math.random() * screenResolutions.length)];
+    const [width, height] = screenRes.split('x').map(Number);
+
+    // Device-spezifische Zufallswerte
+    const deviceMemory = [2, 4, 8, 16][Math.floor(Math.random() * 4)];
+    const hardwareConcurrency = [2, 4, 6, 8][Math.floor(Math.random() * 4)];
+
+    return {
+        userAgent,
+        viewport: { width, height },
+        deviceMemory,
+        hardwareConcurrency,
+        // WICHTIG: locale und timezone NICHT randomisiert
+        locale: 'de-DE',
+        timezoneId: 'Europe/Berlin'
+    };
+}
 
 // Verbesserte Konstanten für Stabilität
 const MAX_LOGIN_ATTEMPTS = 3;
@@ -62,6 +107,21 @@ let memoryCheckTimer = null;
 let browserRestartTimer = null;
 let isShuttingDown = false;
 let lastBrowserRestart = Date.now();
+
+// Watchdog-Variablen für Deadlock-Erkennung
+let watchdogTimer = null;
+let lastHeartbeat = Date.now();
+let highCpuCounter = 0;
+let lastCpuUsage = process.cpuUsage();
+let lastCpuCheck = Date.now();
+const WATCHDOG_INTERVAL = 5000; // 5 Sekunden Check
+const HEARTBEAT_TIMEOUT = 120000; // 120 Sekunden ohne Heartbeat = Deadlock (2 Minuten)
+const HIGH_CPU_THRESHOLD = 80; // 80% CPU vom Script
+const HIGH_CPU_DURATION = 30000; // 30 Sekunden
+
+// NaN-Fehlertracking
+let nanErrorCount = 0;
+const MAX_NAN_ERRORS = 3;
 
 // Circuit Breaker Pattern
 class CircuitBreaker {
@@ -111,6 +171,205 @@ class CircuitBreaker {
 
 const circuitBreaker = new CircuitBreaker(MAX_CONSECUTIVE_ERRORS, 5 * 60 * 1000);
 
+// Heartbeat-Signal für Watchdog
+function updateHeartbeat() {
+    lastHeartbeat = Date.now();
+}
+
+// Watchdog-Funktion zur Deadlock-Erkennung
+function startWatchdog() {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    
+    watchdogTimer = setInterval(async () => {
+        if (isShuttingDown) return;
+
+        const now = Date.now();
+        const timeSinceLastHeartbeat = now - lastHeartbeat;
+        
+        // CPU-Auslastung vom Script selbst berechnen
+        const currentCpuUsage = process.cpuUsage(lastCpuUsage);
+        const elapseMs = now - lastCpuCheck;
+        
+        // CPU-Zeit in Millisekunden
+        const cpuTimeMs = (currentCpuUsage.user + currentCpuUsage.system) / 1000;
+        
+        // CPU-Auslastung in Prozent (eines Cores)
+        const cpuPercent = (cpuTimeMs / elapseMs) * 100;
+        
+        // Update für nächsten Check
+        lastCpuUsage = process.cpuUsage();
+        lastCpuCheck = now;
+
+        // Deadlock-Erkennung: Kein Heartbeat für zu lange
+        if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT) {
+            logger.error(`🚨 WATCHDOG: Deadlock erkannt! Kein Heartbeat seit ${timeSinceLastHeartbeat}ms - Versuche Browser-Restart`);
+            sendMessage(`🚨 WATCHDOG: Script scheint zu hängen (${timeSinceLastHeartbeat}ms kein Heartbeat) - Versuche Restart`, "warn");
+            
+            try {
+                await restartBrowser();
+                logger.info("Browser nach Deadlock erfolgreich neu gestartet");
+                return; // Fortfahren mit nächstem Check
+            } catch (restartError) {
+                logger.error(`Browser-Restart nach Deadlock fehlgeschlagen: ${restartError.message} - Erzwinge Shutdown`);
+                gracefulShutdown('WATCHDOG_DEADLOCK_RESTART_FAILED');
+            }
+            return;
+        }
+
+        // CPU-Überwachung (nur vom Script selbst)
+        if (cpuPercent > HIGH_CPU_THRESHOLD) {
+            highCpuCounter++;
+            logger.warn(`⚠️ WATCHDOG: Hohe CPU-Auslastung erkannt (${Math.round(cpuPercent)}%) [${highCpuCounter}x]`);
+
+            if (highCpuCounter * WATCHDOG_INTERVAL > HIGH_CPU_DURATION) {
+                logger.error(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU für ${(highCpuCounter * WATCHDOG_INTERVAL / 1000).toFixed(1)}s - Erzwinge Restart`);
+                sendMessage(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU - Browser wird neu gestartet`, "warn");
+                highCpuCounter = 0;
+                await restartBrowser();
+            }
+        } else {
+            highCpuCounter = 0; // Reset bei normaler CPU
+        }
+
+        logger.debug(`WATCHDOG: Heartbeat ok, Script-CPU: ${Math.round(cpuPercent)}%, Speicher: ${getMemoryUsage().rss}MB`);
+    }, WATCHDOG_INTERVAL);
+}
+
+function stopWatchdog() {
+    if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+    }
+}
+
+// Funktion zum Zurücksetzen der NaN-Fehler
+function resetNanErrors() {
+    nanErrorCount = 0;
+}
+
+// Funktion zum Killen von existierenden script.js-Instanzen
+async function killExistingScriptInstances() {
+    try {
+        const isWindows = process.platform === 'win32';
+        const isLinux = process.platform === 'linux';
+        const isMac = process.platform === 'darwin';
+        const currentPid = process.pid;
+
+        let processesKilled = 0;
+        const { execSync } = await import('child_process');
+
+        if (isWindows) {
+            // Auf Windows: Finde alle node.exe mit script.js
+            try {
+                const output = execSync('tasklist /FI "IMAGENAME eq node.exe" /FO LIST', { encoding: 'utf-8' });
+                const lines = output.split('\n');
+                const pidMatches = lines.filter(l => l.startsWith('PID')).map(l => parseInt(l.split(':')[1].trim()));
+                
+                for (const pid of pidMatches) {
+                    if (pid !== currentPid) {
+                        try {
+                            execSync(`taskkill /F /PID ${pid} 2>nul`, { stdio: 'pipe' });
+                            processesKilled++;
+                            logger.info(`Node.js Prozess ${pid} beendet`);
+                        } catch (err) {
+                            // Prozess konnte nicht gekillt werden
+                        }
+                    }
+                }
+            } catch (err) {
+                // tasklist fehlgeschlagen
+            }
+        } else if (isLinux || isMac) {
+            // Auf Linux/macOS: pgrep nach script.js
+            try {
+                const output = execSync(`pgrep -f "node.*script\.js" 2>/dev/null || true`, { encoding: 'utf-8' });
+                const pids = output.trim().split('\n').filter(line => line.length > 0).map(p => parseInt(p));
+                
+                for (const pid of pids) {
+                    if (pid !== currentPid && !isNaN(pid)) {
+                        try {
+                            execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                            processesKilled++;
+                            logger.info(`Node.js Prozess ${pid} beendet`);
+                        } catch (err) {
+                            // Prozess konnte nicht gekillt werden
+                        }
+                    }
+                }
+            } catch (err) {
+                // pgrep fehlgeschlagen
+            }
+        }
+
+        if (processesKilled > 0) {
+            logger.info(`✅ Insgesamt ${processesKilled} alte script.js-Instanz(en) gekillt`);
+            await delay(1000); // Wartezeit
+        } else {
+            logger.info("✅ Keine alten script.js-Instanzen gefunden");
+        }
+    } catch (error) {
+        logger.warn(`Fehler beim Killen von script.js-Instanzen: ${error.message}`);
+    }
+}
+async function killExistingPlaywright() {
+    try {
+        const isWindows = process.platform === 'win32';
+        const isLinux = process.platform === 'linux';
+        const isMac = process.platform === 'darwin';
+
+        let processesKilled = 0;
+        const { execSync } = await import('child_process');
+
+        if (isWindows) {
+            // Auf Windows: taskkill für Playwright-Browser-Prozesse
+            const browsers = [
+                { name: 'chrome.exe', display: 'Chrome' },
+                { name: 'firefox.exe', display: 'Firefox' },
+                { name: 'msedgedriver.exe', display: 'Edge' }
+            ];
+
+            for (const browser of browsers) {
+                try {
+                    execSync(`taskkill /F /IM ${browser.name} 2>nul`, { stdio: 'pipe' });
+                    processesKilled++;
+                    logger.info(`${browser.display}-Prozess beendet`);
+                } catch (err) {
+                    // Prozess nicht gefunden ist ok
+                }
+            }
+        } else if (isLinux || isMac) {
+            // Auf Linux/macOS: pgrep zum Zählen, dann pkill zum Killen
+            const browserProcesses = ['chrome', 'firefox', 'chromium', 'chromium-browser', 'google-chrome'];
+            
+            for (const processName of browserProcesses) {
+                try {
+                    // Zähle wie viele Prozesse gefunden wurden
+                    const output = execSync(`pgrep -f ${processName} 2>/dev/null || true`, { encoding: 'utf-8' });
+                    const count = output.trim().split('\n').filter(line => line.length > 0).length;
+                    
+                    if (count > 0) {
+                        // Killen
+                        execSync(`pkill -f ${processName} 2>/dev/null || true`, { stdio: 'pipe' });
+                        processesKilled += count;
+                        logger.info(`${count} ${processName}-Prozess(e) beendet`);
+                    }
+                } catch (err) {
+                    // Prozess nicht gefunden ist ok
+                }
+            }
+        }
+
+        if (processesKilled > 0) {
+            logger.info(`✅ Insgesamt ${processesKilled} Browser-Prozess(e) gekillt`);
+            await delay(1000); // Wartezeit um sicherzustellen dass Prozesse gelöscht sind
+        } else {
+            logger.info("✅ Keine laufenden Browser-Prozesse gefunden");
+        }
+    } catch (error) {
+        logger.warn(`Fehler beim Killen von Playwright-Prozessen: ${error.message}`);
+    }
+}
+
 // Memory Monitoring
 function getMemoryUsage() {
     const usage = process.memoryUsage();
@@ -150,7 +409,7 @@ function saveSessionMeta() {
         const sessionMeta = {
             lastActivity: lastActivityTime,
             loginTime: Date.now(),
-            userAgent: USER_AGENT,
+            // userAgent wird jetzt dynamisch generiert, nicht gespeichert
             browserRestartTime: lastBrowserRestart,
             memoryUsage: getMemoryUsage()
         };
@@ -240,6 +499,7 @@ async function keepSessionAlive() {
             await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
             lastActivityTime = Date.now();
             saveSessionMeta();
+            updateHeartbeat(); // Watchdog-Signal
             logger.info("Session Keep-Alive erfolgreich");
         })();
 
@@ -331,6 +591,10 @@ async function initializeBrowser() {
             logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
         }
 
+        // Generiere zufällige Fingerprint (außer locale/timezone)
+        const fingerprint = generateFingerprint();
+        logger.info(`🎭 Neue Browser-Fingerprint: UA=${fingerprint.userAgent.substring(0, 60)}..., Viewport=${fingerprint.viewport.width}x${fingerprint.viewport.height}, Memory=${fingerprint.deviceMemory}GB, Cores=${fingerprint.hardwareConcurrency}`);
+
         const browserOptions = {
             headless: true,
             args: [
@@ -344,7 +608,9 @@ async function initializeBrowser() {
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding"
             ],
-            userAgent: USER_AGENT,
+            userAgent: fingerprint.userAgent,
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezoneId,
             storageState: fs.existsSync(cookiefile) ? cookiefile : undefined
         };
 
@@ -355,6 +621,18 @@ async function initializeBrowser() {
 
         logger.info("Browser erfolgreich gestartet");
         page = await context.newPage();
+
+        // Setze Viewport und Device-Properties basierend auf generierter Fingerprint
+        const fingerprint2 = generateFingerprint();
+        await page.setViewportSize(fingerprint2.viewport);
+        await page.addInitScript(`
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => ${fingerprint2.deviceMemory}
+            });
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => ${fingerprint2.hardwareConcurrency}
+            });
+        `);
 
         // Event Listeners für Debugging
         page.on('request', request => {
@@ -534,8 +812,30 @@ async function main() {
 				return result;
 			});
 			
-			const datenVerfuegbar = usage.tarif.available;
+			let datenVerfuegbar = usage.tarif.available;
 			const refillVerfuegbar = usage.refill.available;
+
+			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
+			if (isNaN(datenVerfuegbar)) {
+				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount + 1}/${MAX_NAN_ERRORS}`);
+				nanErrorCount++;
+				
+				if (nanErrorCount >= MAX_NAN_ERRORS) {
+					logger.error("Zu viele NaN-Fehler - Logout und Neustart");
+					sendMessage("⚠️ Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
+					
+					// Browser komplett neu starten (löscht alles und loggt aus)
+					await restartBrowser();
+					nanErrorCount = 0;
+					
+					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
+				}
+				
+				return 0; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
+			}
+
+			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
+			resetNanErrors();
 
 			// Log both volumes
 			const tarifMessage = `📊 Tarif: ${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
@@ -581,6 +881,7 @@ async function main() {
             datenVolumen = datenVerfuegbar;
             lastActivityTime = Date.now();
             saveSessionMeta();
+            updateHeartbeat(); // Watchdog-Signal
 
             // Send status update with volumes
             let finalStatusMessage = tarifMessage;
@@ -785,14 +1086,32 @@ function stopTimers() {
         clearInterval(browserRestartTimer);
         browserRestartTimer = null;
     }
+    stopWatchdog();
 }
 
 // Verbesserte Hauptschleife mit besserer Fehlerbehandlung
-function start() {
+async function start() {
     logger.info("🚀 Starting lidl-extender script v" + version);
+
+    // Killen von existierenden Playwright-Prozessen beim Start (nur wenn aktiviert)
+    if (killExistingProcesses) {
+        logger.info("Prüfe auf existierende Playwright-Prozesse (KILL_EXISTING_PROCESSES=true)...");
+        await killExistingPlaywright();
+    } else {
+        logger.info("Überspringen: KILL_EXISTING_PROCESSES=false (keine Prozesse werden gekillt)");
+    }
+
+    // Killen von existierenden script.js-Instanzen beim Start (nur wenn aktiviert)
+    if (killScriptInstances) {
+        logger.info("Prüfe auf existierende script.js-Instanzen (KILL_SCRIPT_INSTANCES=true)...");
+        await killExistingScriptInstances();
+    } else {
+        logger.info("Überspringen: KILL_SCRIPT_INSTANCES=false (alte Instanzen werden NICHT gekillt)");
+    }
 
     // Starte alle Timer
     startTimers();
+    startWatchdog(); // Watchdog für Deadlock/CPU-Überwachung
 
     let mainTimeout = null;
 
@@ -917,7 +1236,7 @@ process.on('uncaughtException', (error) => {
 
 // Starte das Script
 try {
-    start();
+    await start();
 } catch (error) {
     logger.error(`Fehler beim Starten: ${error.message}`);
     sendMessage(`🚨 Fehler beim Starten: ${error.message}`, "error");
