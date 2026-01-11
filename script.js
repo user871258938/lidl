@@ -1069,6 +1069,7 @@ function startTimers() {
     browserRestartTimer = setInterval(async () => {
         if (!isShuttingDown) {
             logger.info("Planmäßiger Browser-Neustart nach 2 Stunden");
+            updateHeartbeat(); // Signalisiere Watchdog dass Restart beabsichtigt ist
             await restartBrowser();
         }
     }, BROWSER_RESTART_INTERVAL);
