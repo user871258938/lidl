@@ -555,6 +555,7 @@ async function restartBrowser() {
         if (success) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
+            updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
             logger.info("Browser erfolgreich neu gestartet");
             sendMessage("🔄 Browser wurde neu gestartet", "info");
         } else {
