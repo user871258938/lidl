@@ -858,11 +858,11 @@ async function main() {
                     const refillVorher = refillVerfuegbar;
                     
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
-                    await delay(7000);
+                    await delay(10000);
                     
                     // Seite neu laden und Refill-Volumen neu prüfen
                     await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-                    await delay(2000);
+                    await delay(5000);
                     
                     const usageNach = await page.evaluate(() => {
                         const result = { available: NaN, total: NaN, unit: '' };
@@ -899,9 +899,7 @@ async function main() {
                 if (!nachbuchungsErfolg) {
                     sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
                 } else {
-                    let statusMessage = `✅ Nachbuchung erfolgreich!\n${tarifMessage}`;
-                    if (refillMessage) statusMessage += `\n${refillMessage}`;
-                    sendMessage(statusMessage, "info");
+                    sendMessage("✅ Refill erfolgreich aktiviert!", "info");
                     datenVerfuegbar += 1;
                 }
             }
@@ -912,9 +910,12 @@ async function main() {
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
-            // Send status update with volumes
-            let finalStatusMessage = tarifMessage;
-            if (refillMessage) finalStatusMessage += `\n${refillMessage}`;
+            // Sende kombinierte Nachricht mit Tarif, Refill und verfügbarem Volumen
+            let finalStatusMessage = `📊 Tarif: ${usage.tarif.available} GB / ${usage.tarif.total} GB`;
+            if (!isNaN(refillVerfuegbar)) {
+                finalStatusMessage += `\n📊 Refill: ${usage.refill.available} GB / ${usage.refill.total} GB`;
+            }
+            finalStatusMessage += `\n\n📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${getInterval(datenVolumen)} Sekunden.`;
             sendMessage(finalStatusMessage, "info");
 
             return datenVolumen;
@@ -1194,7 +1195,6 @@ async function start() {
             if (datenVolumen !== 0) {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
                 logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
-                sendMessage(`📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`, "info");
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
             }
