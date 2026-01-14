@@ -884,6 +884,8 @@ async function main() {
                     if (!isNaN(refillNachher) && refillNachher > refillVorher) {
                         nachbuchungsErfolg = true;
                         logger.info(`✅ Refill erfolgreich aktiviert: ${refillVorher}GB → ${refillNachher}GB`);
+                        // Aktualisiere usage.refill mit neuen Werten für die finale Nachricht
+                        usage.refill = usageNach;
                     } else {
                         logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
