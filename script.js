@@ -852,34 +852,60 @@ async function main() {
 
             // Nachbuchung falls nötig
             let nachbuchungsErfolg = false;
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1) {
+            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.5)) {
                 try {
                     logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
+                    const refillVorher = refillVerfuegbar;
+                    
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
                     await delay(7000);
-                    const successSelector = ".alert";
-                    if (await page.$(successSelector)) {
+                    
+                    // Seite neu laden und Refill-Volumen neu prüfen
+                    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+                    await delay(2000);
+                    
+                    const usageNach = await page.evaluate(() => {
+                        const result = { available: NaN, total: NaN, unit: '' };
+                        const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
+                        if (refillLabel) {
+                            const text = refillLabel.textContent.trim();
+                            const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+                            result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+                            result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+                            const unitEl = refillLabel.querySelector('span.unit');
+                            result.unit = unitEl ? unitEl.textContent.trim() : '';
+                        }
+                        return result;
+                    });
+                    
+                    const refillNachher = usageNach.available;
+                    
+                    // Prüfe ob Refill sich erhöht hat
+                    if (!isNaN(refillNachher) && refillNachher > refillVorher) {
                         nachbuchungsErfolg = true;
-                        logger.info("Nachbuchung erfolgreich bestätigt.");
+                        logger.info(`✅ Refill erfolgreich aktiviert: ${refillVorher}GB → ${refillNachher}GB`);
                     } else {
-                        logger.warn("Kein Erfolgs-Alert gefunden");
+                        logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
                 } catch (e) {
                     logger.error(`Fehler beim Nachbuchungsversuch: ${e.message}`);
                 }
             }
 
-            // Status-Nachrichten
-            if (datenVerfuegbar < 1 && !nachbuchungsErfolg) {
-                sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
-            } else if (datenVerfuegbar < 1 && nachbuchungsErfolg) {
-                let statusMessage = `✅ Nachbuchung erfolgreich!\n${tarifMessage}`;
-                if (refillMessage) statusMessage += `\n${refillMessage}`;
-                sendMessage(statusMessage, "info");
-                datenVerfuegbar += 1;
+            // Status-Nachrichten (nur wenn Nachbuchung versucht wurde: Tarif < 1 && Refill < 0.5)
+            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.5)) {
+                if (!nachbuchungsErfolg) {
+                    sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
+                } else {
+                    let statusMessage = `✅ Nachbuchung erfolgreich!\n${tarifMessage}`;
+                    if (refillMessage) statusMessage += `\n${refillMessage}`;
+                    sendMessage(statusMessage, "info");
+                    datenVerfuegbar += 1;
+                }
             }
 
-            datenVolumen = datenVerfuegbar;
+            // Gesamtes verfügbares Datenvolumen = Tarif + Refill
+            datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
             lastActivityTime = Date.now();
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
