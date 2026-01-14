@@ -854,8 +854,8 @@ async function main() {
             let nachbuchungsErfolg = false;
             if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1) {
                 try {
-                    logger.info("Wenig Datenvolumen, versuche Nachbuchung...");
-                    await page.click('a[href*="tarife-und-optionen.html#bookableOptionsOverview"]', { timeout: 10000 });
+                    logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
+                    await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
                     await delay(7000);
                     const successSelector = ".alert";
                     if (await page.$(successSelector)) {
