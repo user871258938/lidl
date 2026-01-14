@@ -115,7 +115,7 @@ let highCpuCounter = 0;
 let lastCpuUsage = process.cpuUsage();
 let lastCpuCheck = Date.now();
 const WATCHDOG_INTERVAL = 5000; // 5 Sekunden Check
-const HEARTBEAT_TIMEOUT = 120000; // 120 Sekunden ohne Heartbeat = Deadlock (2 Minuten)
+const HEARTBEAT_TIMEOUT = 180000; // 180 Sekunden ohne Heartbeat = Deadlock (3 Minuten) - 60s Buffer zur Keep-Alive
 const HIGH_CPU_THRESHOLD = 80; // 80% CPU vom Script
 const HIGH_CPU_DURATION = 30000; // 30 Sekunden
 
