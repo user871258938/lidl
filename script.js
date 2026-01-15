@@ -36,7 +36,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.2";
+const version = "1.2.3";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -814,7 +814,7 @@ async function main() {
 			});
 			
 			let datenVerfuegbar = usage.tarif.available;
-			const refillVerfuegbar = usage.refill.available;
+			let refillVerfuegbar = usage.refill.available;
 
 			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
 			if (isNaN(datenVerfuegbar)) {
@@ -850,19 +850,19 @@ async function main() {
 			
 			logger.info(tarifMessage);
 
-            // Nachbuchung falls nötig
+            // Nachbuchung falls nötig (unter 0.8 GB vom Refill Volumen)
             let nachbuchungsErfolg = false;
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.5)) {
+            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8)) {
                 try {
                     logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
                     const refillVorher = refillVerfuegbar;
                     
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
-                    await delay(10000);
+                    await delay(7000);
                     
                     // Seite neu laden und Refill-Volumen neu prüfen
                     await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-                    await delay(5000);
+                    await delay(2000);
                     
                     const usageNach = await page.evaluate(() => {
                         const result = { available: NaN, total: NaN, unit: '' };
@@ -884,39 +884,38 @@ async function main() {
                     if (!isNaN(refillNachher) && refillNachher > refillVorher) {
                         nachbuchungsErfolg = true;
                         logger.info(`✅ Refill erfolgreich aktiviert: ${refillVorher}GB → ${refillNachher}GB`);
-                        // Aktualisiere usage.refill mit neuen Werten für die finale Nachricht
-                        usage.refill = usageNach;
+                        
+                        // Aktualisiere refillVerfuegbar mit neuem Wert für korrekte Berechnung
+                        refillVerfuegbar = refillNachher;
+                        
+                        // Erfolgs-Nachricht sofort senden
+                        let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
+                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / 25 GB\n`;
+                        successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
+                        sendMessage(successMessage, "info");
                     } else {
                         logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
                 } catch (e) {
                     logger.error(`Fehler beim Nachbuchungsversuch: ${e.message}`);
-                }
-            }
-
-            // Status-Nachrichten (nur wenn Nachbuchung versucht wurde: Tarif < 1 && Refill < 0.5)
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.5)) {
-                if (!nachbuchungsErfolg) {
-                    sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
-                } else {
-                    sendMessage("✅ Refill erfolgreich aktiviert!", "info");
-                    datenVerfuegbar += 1;
+                    sendMessage(`❌ Refill-Aktivierung fehlgeschlagen: ${e.message}`, "error");
                 }
             }
 
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
-            datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
+            datenVolumen = datenVerfuegbar + refillVerfuegbar;
             lastActivityTime = Date.now();
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
-            // Sende kombinierte Nachricht mit Tarif, Refill und verfügbarem Volumen
-            let finalStatusMessage = `📊 Tarif: ${usage.tarif.available} GB / ${usage.tarif.total} GB`;
-            if (!isNaN(refillVerfuegbar)) {
-                finalStatusMessage += `\n📊 Refill: ${usage.refill.available} GB / ${usage.refill.total} GB`;
-            }
-            finalStatusMessage += `\n\n📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${getInterval(datenVolumen)} Sekunden.`;
-            sendMessage(finalStatusMessage, "info");
+                // Send status update with volumes (nur wenn kein Refill durchgeführt wurde)
+                if (!nachbuchungsErfolg) {
+                    let finalStatusMessage = tarifMessage;
+                    if (!isNaN(refillVerfuegbar)) {
+                        finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+                    }
+                    sendMessage(finalStatusMessage, "info");
+                }
 
             return datenVolumen;
         });
@@ -1195,6 +1194,7 @@ async function start() {
             if (datenVolumen !== 0) {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
                 logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
+                sendMessage(`📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`, "info");
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
             }
