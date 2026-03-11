@@ -6,6 +6,12 @@ Dieses Projekt löst das Problem, den Datenverbrauch manuell überprüfen zu mü
 
 ---
 
+## 🔍 Hinweis
+
+Dieses Skript dient ausschließlich zu Demonstrationszwecken. Auch wenn die Nutzung von Skripten oder Bots zur Automatisierung technisch möglich und nachvollziehbar erscheint, ist deren Einsatz laut den Richtlinien der Firma strengstens untersagt. Verstöße gegen diese Regelung insbesondere automatisierte Abläufe können zu einem sofortigen Ausschluss bzw. zur Kündigung führen.
+
+---
+
 ## 🚀 Funktionen
 
 - **Automatische Anmeldung:** Meldet sich mit Playwright bei deinem Lidl-Connect-Konto an.

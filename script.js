@@ -1,10 +1,17 @@
 import createLogger from "logging";
 import * as playwright from "playwright";
 import axios from "axios";
+
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ path: new URL('./.env', import.meta.url).pathname });
+// .env geladen?
+if (!process.env.RUFNUMMER || !process.env.PASSWORD) {
+    throw new Error("ENV Fehler: RUFNUMMER oder PASSWORD fehlt oder ist leer");
+}
+
 import * as fs from "fs";
 import { exec } from "child_process";
+import os from "os";
 
 const logger = createLogger("lidl-extender");
 
@@ -17,6 +24,8 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID;
 const telegramAllow = process.env.TELEGRAM_ALLOW === "true";
 const discordAllow = process.env.DISCORD_ALLOW === "true";
 const autoUpdate = process.env.AUTO_UPDATE === "true";
+const killExistingProcesses = process.env.KILL_EXISTING_PROCESSES === "true";
+const killScriptInstances = process.env.KILL_SCRIPT_INSTANCES === "true";
 const sleepmode = process.env.SLEEP_MODE;
 const sleepTime = parseInt(process.env.SLEEP_TIME, 10);
 const infoLevel = process.env.INFO_LEVEL || "info";
@@ -24,17 +33,59 @@ const infoLevel = process.env.INFO_LEVEL || "info";
 // URLs
 const telegramApiUrl = `https://api.telegram.org/bot${telegramToken}/sendMessage`;
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
-const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
-const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/mein-tarif/uebersicht.html";
+const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
+const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.1.1";
+const version = "1.2.3";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/139.0";
 const delay = ms => new Promise(res => setTimeout(res, ms));
 const cookiefile = "cookies.json";
 const sessionMetaFile = "session_meta.json";
+
+// Browser-Fingerprint-Randomisierung (ohne locale/timezone)
+function generateFingerprint() {
+    // Firefox User-Agents mit verschiedenen Versionen
+    const firefoxVersions = [
+        { version: '139.0', geckoDate: '20100101' },
+        { version: '138.0', geckoDate: '20100101' },
+        { version: '137.0', geckoDate: '20100101' },
+        { version: '136.0', geckoDate: '20100101' },
+        { version: '135.0', geckoDate: '20100101' }
+    ];
+
+    // Windows-Versionen
+    const windowsVersions = ['10.0', '11.0'];
+
+    // Zufällige Bildschirmauflösungen
+    const screenResolutions = [
+        '1920x1080', '1366x768', '1440x900', '1600x900', '2560x1440',
+        '1920x1200', '2880x1800', '1280x720', '3440x1440'
+    ];
+
+    const randomVersion = firefoxVersions[Math.floor(Math.random() * firefoxVersions.length)];
+    const randomWindows = windowsVersions[Math.floor(Math.random() * windowsVersions.length)];
+
+    const userAgent = `Mozilla/5.0 (Windows NT ${randomWindows}; Win64; x64; rv:${randomVersion.version}) Gecko/${randomVersion.geckoDate} Firefox/${randomVersion.version}`;
+
+    const screenRes = screenResolutions[Math.floor(Math.random() * screenResolutions.length)];
+    const [width, height] = screenRes.split('x').map(Number);
+
+    // Device-spezifische Zufallswerte
+    const deviceMemory = [2, 4, 8, 16][Math.floor(Math.random() * 4)];
+    const hardwareConcurrency = [2, 4, 6, 8][Math.floor(Math.random() * 4)];
+
+    return {
+        userAgent,
+        viewport: { width, height },
+        deviceMemory,
+        hardwareConcurrency,
+        // WICHTIG: locale und timezone NICHT randomisiert
+        locale: 'de-DE',
+        timezoneId: 'Europe/Berlin'
+    };
+}
 
 // Verbesserte Konstanten für Stabilität
 const MAX_LOGIN_ATTEMPTS = 3;
@@ -56,6 +107,21 @@ let memoryCheckTimer = null;
 let browserRestartTimer = null;
 let isShuttingDown = false;
 let lastBrowserRestart = Date.now();
+
+// Watchdog-Variablen für Deadlock-Erkennung
+let watchdogTimer = null;
+let lastHeartbeat = Date.now();
+let highCpuCounter = 0;
+let lastCpuUsage = process.cpuUsage();
+let lastCpuCheck = Date.now();
+const WATCHDOG_INTERVAL = 5000; // 5 Sekunden Check
+const HEARTBEAT_TIMEOUT = 180000; // 180 Sekunden ohne Heartbeat = Deadlock (3 Minuten) - 60s Buffer zur Keep-Alive
+const HIGH_CPU_THRESHOLD = 80; // 80% CPU vom Script
+const HIGH_CPU_DURATION = 30000; // 30 Sekunden
+
+// NaN-Fehlertracking
+let nanErrorCount = 0;
+const MAX_NAN_ERRORS = 3;
 
 // Circuit Breaker Pattern
 class CircuitBreaker {
@@ -105,6 +171,205 @@ class CircuitBreaker {
 
 const circuitBreaker = new CircuitBreaker(MAX_CONSECUTIVE_ERRORS, 5 * 60 * 1000);
 
+// Heartbeat-Signal für Watchdog
+function updateHeartbeat() {
+    lastHeartbeat = Date.now();
+}
+
+// Watchdog-Funktion zur Deadlock-Erkennung
+function startWatchdog() {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    
+    watchdogTimer = setInterval(async () => {
+        if (isShuttingDown) return;
+
+        const now = Date.now();
+        const timeSinceLastHeartbeat = now - lastHeartbeat;
+        
+        // CPU-Auslastung vom Script selbst berechnen
+        const currentCpuUsage = process.cpuUsage(lastCpuUsage);
+        const elapseMs = now - lastCpuCheck;
+        
+        // CPU-Zeit in Millisekunden
+        const cpuTimeMs = (currentCpuUsage.user + currentCpuUsage.system) / 1000;
+        
+        // CPU-Auslastung in Prozent (eines Cores)
+        const cpuPercent = (cpuTimeMs / elapseMs) * 100;
+        
+        // Update für nächsten Check
+        lastCpuUsage = process.cpuUsage();
+        lastCpuCheck = now;
+
+        // Deadlock-Erkennung: Kein Heartbeat für zu lange
+        if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT) {
+            logger.error(`🚨 WATCHDOG: Deadlock erkannt! Kein Heartbeat seit ${timeSinceLastHeartbeat}ms - Versuche Browser-Restart`);
+            sendMessage(`🚨 WATCHDOG: Script scheint zu hängen (${timeSinceLastHeartbeat}ms kein Heartbeat) - Versuche Restart`, "warn");
+            
+            try {
+                await restartBrowser();
+                logger.info("Browser nach Deadlock erfolgreich neu gestartet");
+                return; // Fortfahren mit nächstem Check
+            } catch (restartError) {
+                logger.error(`Browser-Restart nach Deadlock fehlgeschlagen: ${restartError.message} - Erzwinge Shutdown`);
+                gracefulShutdown('WATCHDOG_DEADLOCK_RESTART_FAILED');
+            }
+            return;
+        }
+
+        // CPU-Überwachung (nur vom Script selbst)
+        if (cpuPercent > HIGH_CPU_THRESHOLD) {
+            highCpuCounter++;
+            logger.warn(`⚠️ WATCHDOG: Hohe CPU-Auslastung erkannt (${Math.round(cpuPercent)}%) [${highCpuCounter}x]`);
+
+            if (highCpuCounter * WATCHDOG_INTERVAL > HIGH_CPU_DURATION) {
+                logger.error(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU für ${(highCpuCounter * WATCHDOG_INTERVAL / 1000).toFixed(1)}s - Erzwinge Restart`);
+                sendMessage(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU - Browser wird neu gestartet`, "warn");
+                highCpuCounter = 0;
+                await restartBrowser();
+            }
+        } else {
+            highCpuCounter = 0; // Reset bei normaler CPU
+        }
+
+        logger.debug(`WATCHDOG: Heartbeat ok, Script-CPU: ${Math.round(cpuPercent)}%, Speicher: ${getMemoryUsage().rss}MB`);
+    }, WATCHDOG_INTERVAL);
+}
+
+function stopWatchdog() {
+    if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+    }
+}
+
+// Funktion zum Zurücksetzen der NaN-Fehler
+function resetNanErrors() {
+    nanErrorCount = 0;
+}
+
+// Funktion zum Killen von existierenden script.js-Instanzen
+async function killExistingScriptInstances() {
+    try {
+        const isWindows = process.platform === 'win32';
+        const isLinux = process.platform === 'linux';
+        const isMac = process.platform === 'darwin';
+        const currentPid = process.pid;
+
+        let processesKilled = 0;
+        const { execSync } = await import('child_process');
+
+        if (isWindows) {
+            // Auf Windows: Finde alle node.exe mit script.js
+            try {
+                const output = execSync('tasklist /FI "IMAGENAME eq node.exe" /FO LIST', { encoding: 'utf-8' });
+                const lines = output.split('\n');
+                const pidMatches = lines.filter(l => l.startsWith('PID')).map(l => parseInt(l.split(':')[1].trim()));
+                
+                for (const pid of pidMatches) {
+                    if (pid !== currentPid) {
+                        try {
+                            execSync(`taskkill /F /PID ${pid} 2>nul`, { stdio: 'pipe' });
+                            processesKilled++;
+                            logger.info(`Node.js Prozess ${pid} beendet`);
+                        } catch (err) {
+                            // Prozess konnte nicht gekillt werden
+                        }
+                    }
+                }
+            } catch (err) {
+                // tasklist fehlgeschlagen
+            }
+        } else if (isLinux || isMac) {
+            // Auf Linux/macOS: pgrep nach script.js
+            try {
+                const output = execSync(`pgrep -f "node.*script\.js" 2>/dev/null || true`, { encoding: 'utf-8' });
+                const pids = output.trim().split('\n').filter(line => line.length > 0).map(p => parseInt(p));
+                
+                for (const pid of pids) {
+                    if (pid !== currentPid && !isNaN(pid)) {
+                        try {
+                            execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                            processesKilled++;
+                            logger.info(`Node.js Prozess ${pid} beendet`);
+                        } catch (err) {
+                            // Prozess konnte nicht gekillt werden
+                        }
+                    }
+                }
+            } catch (err) {
+                // pgrep fehlgeschlagen
+            }
+        }
+
+        if (processesKilled > 0) {
+            logger.info(`✅ Insgesamt ${processesKilled} alte script.js-Instanz(en) gekillt`);
+            await delay(1000); // Wartezeit
+        } else {
+            logger.info("✅ Keine alten script.js-Instanzen gefunden");
+        }
+    } catch (error) {
+        logger.warn(`Fehler beim Killen von script.js-Instanzen: ${error.message}`);
+    }
+}
+async function killExistingPlaywright() {
+    try {
+        const isWindows = process.platform === 'win32';
+        const isLinux = process.platform === 'linux';
+        const isMac = process.platform === 'darwin';
+
+        let processesKilled = 0;
+        const { execSync } = await import('child_process');
+
+        if (isWindows) {
+            // Auf Windows: taskkill für Playwright-Browser-Prozesse
+            const browsers = [
+                { name: 'chrome.exe', display: 'Chrome' },
+                { name: 'firefox.exe', display: 'Firefox' },
+                { name: 'msedgedriver.exe', display: 'Edge' }
+            ];
+
+            for (const browser of browsers) {
+                try {
+                    execSync(`taskkill /F /IM ${browser.name} 2>nul`, { stdio: 'pipe' });
+                    processesKilled++;
+                    logger.info(`${browser.display}-Prozess beendet`);
+                } catch (err) {
+                    // Prozess nicht gefunden ist ok
+                }
+            }
+        } else if (isLinux || isMac) {
+            // Auf Linux/macOS: pgrep zum Zählen, dann pkill zum Killen
+            const browserProcesses = ['chrome', 'firefox', 'chromium', 'chromium-browser', 'google-chrome'];
+            
+            for (const processName of browserProcesses) {
+                try {
+                    // Zähle wie viele Prozesse gefunden wurden
+                    const output = execSync(`pgrep -f ${processName} 2>/dev/null || true`, { encoding: 'utf-8' });
+                    const count = output.trim().split('\n').filter(line => line.length > 0).length;
+                    
+                    if (count > 0) {
+                        // Killen
+                        execSync(`pkill -f ${processName} 2>/dev/null || true`, { stdio: 'pipe' });
+                        processesKilled += count;
+                        logger.info(`${count} ${processName}-Prozess(e) beendet`);
+                    }
+                } catch (err) {
+                    // Prozess nicht gefunden ist ok
+                }
+            }
+        }
+
+        if (processesKilled > 0) {
+            logger.info(`✅ Insgesamt ${processesKilled} Browser-Prozess(e) gekillt`);
+            await delay(1000); // Wartezeit um sicherzustellen dass Prozesse gelöscht sind
+        } else {
+            logger.info("✅ Keine laufenden Browser-Prozesse gefunden");
+        }
+    } catch (error) {
+        logger.warn(`Fehler beim Killen von Playwright-Prozessen: ${error.message}`);
+    }
+}
+
 // Memory Monitoring
 function getMemoryUsage() {
     const usage = process.memoryUsage();
@@ -144,7 +409,7 @@ function saveSessionMeta() {
         const sessionMeta = {
             lastActivity: lastActivityTime,
             loginTime: Date.now(),
-            userAgent: USER_AGENT,
+            // userAgent wird jetzt dynamisch generiert, nicht gespeichert
             browserRestartTime: lastBrowserRestart,
             memoryUsage: getMemoryUsage()
         };
@@ -200,18 +465,18 @@ async function validateSession() {
             });
             await delay(2000);
 
-            const loginFormExists = await page.$('#__BVID__27') !== null;
+            const loginFormExists = await page.$('input[name="msisdn"]') !== null;
             if (loginFormExists) {
                 logger.warn("Login-Formular gefunden, Session ungültig");
                 return false;
             }
 
-            await page.waitForSelector(".consumption-info", { timeout: 10000 });
-            logger.info("Session-Validierung erfolgreich");
-            lastActivityTime = Date.now();
-            saveSessionMeta();
-            return true;
-        })();
+            await page.waitForSelector(".app-consumptions .progress-wrapper label.unit-display", { timeout: 10000 });
+			logger.info("Session-Validierung erfolgreich");
+			lastActivityTime = Date.now();
+			saveSessionMeta();
+			return true;
+		})();
 
         return await Promise.race([
             validationPromise,
@@ -234,6 +499,7 @@ async function keepSessionAlive() {
             await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
             lastActivityTime = Date.now();
             saveSessionMeta();
+            updateHeartbeat(); // Watchdog-Signal
             logger.info("Session Keep-Alive erfolgreich");
         })();
 
@@ -289,6 +555,7 @@ async function restartBrowser() {
         if (success) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
+            updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
             logger.info("Browser erfolgreich neu gestartet");
             sendMessage("🔄 Browser wurde neu gestartet", "info");
         } else {
@@ -310,20 +577,24 @@ async function initializeBrowser() {
 
         const userDataDir = './lidl-extender-data';
 
-        // Bereinige alte Browser-Daten bei wiederholten Fehlern
-        if (consecutiveErrors >= 2) {
-            logger.info("Bereinige Browser-Daten aufgrund von Fehlern...");
-            try {
-                if (fs.existsSync(userDataDir)) {
-                    fs.rmSync(userDataDir, { recursive: true, force: true });
-                }
-                if (fs.existsSync(cookiefile)) {
-                    fs.unlinkSync(cookiefile);
-                }
-            } catch (cleanupError) {
-                logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
+        // Lösche Browser-Daten immer beim Start für frischen Login
+        logger.info("Lösche Browser-Daten für frischen Login...");
+        try {
+            if (fs.existsSync(userDataDir)) {
+                fs.rmSync(userDataDir, { recursive: true, force: true });
+                logger.info("userDataDir gelöscht");
             }
+            if (fs.existsSync(cookiefile)) {
+                fs.unlinkSync(cookiefile);
+                logger.info("cookies.json gelöscht");
+            }
+        } catch (cleanupError) {
+            logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
         }
+
+        // Generiere zufällige Fingerprint (außer locale/timezone)
+        const fingerprint = generateFingerprint();
+        logger.info(`🎭 Neue Browser-Fingerprint: UA=${fingerprint.userAgent.substring(0, 60)}..., Viewport=${fingerprint.viewport.width}x${fingerprint.viewport.height}, Memory=${fingerprint.deviceMemory}GB, Cores=${fingerprint.hardwareConcurrency}`);
 
         const browserOptions = {
             headless: true,
@@ -338,7 +609,9 @@ async function initializeBrowser() {
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding"
             ],
-            userAgent: USER_AGENT,
+            userAgent: fingerprint.userAgent,
+            locale: fingerprint.locale,
+            timezoneId: fingerprint.timezoneId,
             storageState: fs.existsSync(cookiefile) ? cookiefile : undefined
         };
 
@@ -349,6 +622,18 @@ async function initializeBrowser() {
 
         logger.info("Browser erfolgreich gestartet");
         page = await context.newPage();
+
+        // Setze Viewport und Device-Properties basierend auf generierter Fingerprint
+        const fingerprint2 = generateFingerprint();
+        await page.setViewportSize(fingerprint2.viewport);
+        await page.addInitScript(`
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => ${fingerprint2.deviceMemory}
+            });
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => ${fingerprint2.hardwareConcurrency}
+            });
+        `);
 
         // Event Listeners für Debugging
         page.on('request', request => {
@@ -397,22 +682,22 @@ async function performLogin() {
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
-            await page.waitForSelector("#__BVID__27", { timeout: 15000 });
-            await page.waitForSelector("#__BVID__31", { timeout: 15000 });
-
-            // Felder leeren und ausfüllen
-            await page.fill("#__BVID__27", "");
-            await page.fill("#__BVID__31", "");
+			await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
+			await page.waitForSelector('input[name="password"]', { timeout: 15000 });
+			
+			// Felder leeren und ausfüllen
+			await page.fill('input[name="msisdn"]', '');
+			await page.fill('input[name="password"]', '');
             await delay(1000);
 
-            await page.fill("#__BVID__27", rufnummer);
-            await page.fill("#__BVID__31", passwort);
+			await page.fill('input[name="msisdn"]', rufnummer);
+            await page.fill('input[name="password"]', passwort);
 
             logger.info("Login-Daten eingegeben, sende Formular...");
 
             // Login-Button klicken und auf Navigation warten
             await Promise.all([
-                page.click("#submit-16"),
+                page.click('button[type="submit"]:has-text("Einloggen")'),
                 page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 })
             ]);
 
@@ -470,32 +755,11 @@ async function main() {
                 }
             }
 
-            // Session-Gültigkeit prüfen
-            let sessionValid = false;
-
-            if (fs.existsSync(cookiefile) && !isSessionExpired()) {
-                logger.info("Prüfe bestehende Session...");
-                sessionValid = await validateSession();
-            }
-
-            // Login falls Session ungültig
-            if (!sessionValid) {
-                logger.info("Session ungültig oder abgelaufen, führe Login durch...");
-
-                // Lösche alte Session-Daten
-                if (fs.existsSync(cookiefile)) {
-                    fs.unlinkSync(cookiefile);
-                }
-                if (fs.existsSync(sessionMetaFile)) {
-                    fs.unlinkSync(sessionMetaFile);
-                }
-
-                const loginSuccess = await performLogin();
-                if (!loginSuccess) {
-                    throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
-                }
-            } else {
-                logger.info("Bestehende Session ist gültig");
+            // Login durchführen (Browser-Daten wurden bereits gelöscht bei initializeBrowser)
+            logger.info("Führe Login durch...");
+            const loginSuccess = await performLogin();
+            if (!loginSuccess) {
+                throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
             }
 
             // Stelle sicher, dass wir auf der Übersichtsseite sind
@@ -504,74 +768,154 @@ async function main() {
                 await delay(2000);
             }
 
-            // Datenvolumen auslesen
-            const usage = await page.$eval('.consumption-info', el => {
-                const unitEl = el.querySelector('span.unit');
-                const unit = unitEl ? unitEl.textContent.trim() : '';
-                const nums = (el.textContent.match(/(\d+(?:[.,]\d+)?)/g) || []).map(n => parseFloat(n.replace(',', '.')));
-                const used = nums[0] ?? NaN;
-                const total = nums[1] ?? NaN;
-                return { used, total, unit };
-            });
-
-            const used = usage.used;
-            let total = usage.total;
-            let datenVerfuegbar = (isNaN(total) || isNaN(used)) ? NaN : +(total - used).toFixed(3);
-
-            // Refill-Daten prüfen
-            let refill = null;
+            // Warte auf Datenvolumen-Element bevor wir extrahieren
             try {
-                refill = await page.$eval('.refill-wrapper > .consumption-info', el => {
-                    const unitEl = el.querySelector('span.unit');
-                    const unit = unitEl ? unitEl.textContent.trim() : '';
-                    const nums = (el.textContent.match(/(\d+(?:[.,]\d+)?)/g) || []).map(n => parseFloat(n.replace(',', '.')));
-                    const used = nums[0] ?? NaN;
-                    const total = nums[1] ?? NaN;
-                    return { used, total, unit };
-                });
-            } catch (e) {
-                logger.warn("Refill-Block nicht gefunden");
+                await page.waitForFunction(() => {
+                    const element = document.querySelector('label[for="DATA"].unit-display');
+                    return element && element.textContent.trim().length > 0;
+                }, { timeout: 15000 });
+                logger.debug("Datenvolumen-Element gefunden und bereit");
+            } catch (error) {
+                logger.warn(`Datenvolumen-Element nicht gefunden: ${error.message}`);
             }
 
-            if (refill && !isNaN(refill.used) && !isNaN(refill.total)) {
-                const refillUsed = refill.used;
-                const refillTotal = refill.total;
-                const refillVerfuegbar = +(refillTotal - refillUsed).toFixed(3);
-                datenVerfuegbar = isNaN(datenVerfuegbar)
-                    ? refillVerfuegbar
-                    : +(datenVerfuegbar + refillVerfuegbar).toFixed(3);
-            }
+            await delay(1000); // Zusätzliche kurze Wartezeit
 
-            // Nachbuchung falls nötig
+			// Datenvolumen auslesen (Tarif + Refill)
+			const usage = await page.evaluate(() => {
+				const result = {
+					tarif: { available: NaN, total: NaN, unit: '' },
+					refill: { available: NaN, total: NaN, unit: '' }
+				};
+
+				// Get Tarif data (DATA id)
+				const tarifLabel = document.querySelector('label[for="DATA"].unit-display');
+				if (tarifLabel) {
+					const text = tarifLabel.textContent.trim();
+					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+					result.tarif.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+					result.tarif.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+					const unitEl = tarifLabel.querySelector('span.unit');
+					result.tarif.unit = unitEl ? unitEl.textContent.trim() : '';
+				}
+
+				// Get Refill data (REFILLABLE_DATA id) - optional, may not always be present
+				const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
+				if (refillLabel) {
+					const text = refillLabel.textContent.trim();
+					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+					result.refill.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+					result.refill.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+					const unitEl = refillLabel.querySelector('span.unit');
+					result.refill.unit = unitEl ? unitEl.textContent.trim() : '';
+				}
+
+				return result;
+			});
+			
+			let datenVerfuegbar = usage.tarif.available;
+			let refillVerfuegbar = usage.refill.available;
+
+			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
+			if (isNaN(datenVerfuegbar)) {
+				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount + 1}/${MAX_NAN_ERRORS}`);
+				nanErrorCount++;
+				
+				if (nanErrorCount >= MAX_NAN_ERRORS) {
+					logger.error("Zu viele NaN-Fehler - Logout und Neustart");
+					sendMessage("⚠️ Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
+					
+					// Browser komplett neu starten (löscht alles und loggt aus)
+					await restartBrowser();
+					nanErrorCount = 0;
+					
+					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
+				}
+				
+				return 0; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
+			}
+
+			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
+			resetNanErrors();
+
+			// Log both volumes
+			const tarifMessage = `📊 Tarif: ${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
+			let refillMessage = '';
+			
+			// Only log refill if it's available (has valid numbers)
+			if (!isNaN(refillVerfuegbar)) {
+				refillMessage = `📊 Refill: ${usage.refill.available} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+				logger.info(refillMessage);
+			}
+			
+			logger.info(tarifMessage);
+
+            // Nachbuchung falls nötig (unter 0.8 GB vom Refill Volumen)
             let nachbuchungsErfolg = false;
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1) {
+            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8)) {
                 try {
-                    logger.info("Wenig Datenvolumen, versuche Nachbuchung...");
-                    await page.click(".tariff-btn-176", { timeout: 10000 });
+                    logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
+                    const refillVorher = refillVerfuegbar;
+                    
+                    await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
                     await delay(7000);
-                    const successSelector = ".alert";
-                    if (await page.$(successSelector)) {
+                    
+                    // Seite neu laden und Refill-Volumen neu prüfen
+                    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+                    await delay(2000);
+                    
+                    const usageNach = await page.evaluate(() => {
+                        const result = { available: NaN, total: NaN, unit: '' };
+                        const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
+                        if (refillLabel) {
+                            const text = refillLabel.textContent.trim();
+                            const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+                            result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+                            result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+                            const unitEl = refillLabel.querySelector('span.unit');
+                            result.unit = unitEl ? unitEl.textContent.trim() : '';
+                        }
+                        return result;
+                    });
+                    
+                    const refillNachher = usageNach.available;
+                    
+                    // Prüfe ob Refill sich erhöht hat
+                    if (!isNaN(refillNachher) && refillNachher > refillVorher) {
                         nachbuchungsErfolg = true;
-                        logger.info("Nachbuchung erfolgreich bestätigt.");
+                        logger.info(`✅ Refill erfolgreich aktiviert: ${refillVorher}GB → ${refillNachher}GB`);
+                        
+                        // Aktualisiere refillVerfuegbar mit neuem Wert für korrekte Berechnung
+                        refillVerfuegbar = refillNachher;
+                        
+                        // Erfolgs-Nachricht sofort senden
+                        let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
+                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / 25 GB\n`;
+                        successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
+                        sendMessage(successMessage, "info");
                     } else {
-                        logger.warn("Kein Erfolgs-Alert gefunden");
+                        logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
                 } catch (e) {
                     logger.error(`Fehler beim Nachbuchungsversuch: ${e.message}`);
+                    sendMessage(`❌ Refill-Aktivierung fehlgeschlagen: ${e.message}`, "error");
                 }
             }
 
-            // Status-Nachrichten
-            if (datenVerfuegbar < 1 && !nachbuchungsErfolg) {
-                sendMessage("❌ Nachbuchung fehlgeschlagen, bitte manuell nachbuchen.", "error");
-            } else if (datenVerfuegbar < 1 && nachbuchungsErfolg) {
-                sendMessage(`✅ Nachbuchung erfolgreich! Verfügbares Datenvolumen: ${datenVerfuegbar + 1} GB`, "info");
-                datenVerfuegbar += 1;
-            }
-
-            datenVolumen = datenVerfuegbar;
+            // Gesamtes verfügbares Datenvolumen = Tarif + Refill
+            datenVolumen = datenVerfuegbar + refillVerfuegbar;
             lastActivityTime = Date.now();
             saveSessionMeta();
+            updateHeartbeat(); // Watchdog-Signal
+
+                // Send status update with volumes (nur wenn kein Refill durchgeführt wurde)
+                if (!nachbuchungsErfolg) {
+                    let finalStatusMessage = tarifMessage;
+                    if (!isNaN(refillVerfuegbar)) {
+                        finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+                    }
+                    sendMessage(finalStatusMessage, "info");
+                }
 
             return datenVolumen;
         });
@@ -753,6 +1097,7 @@ function startTimers() {
     browserRestartTimer = setInterval(async () => {
         if (!isShuttingDown) {
             logger.info("Planmäßiger Browser-Neustart nach 2 Stunden");
+            updateHeartbeat(); // Signalisiere Watchdog dass Restart beabsichtigt ist
             await restartBrowser();
         }
     }, BROWSER_RESTART_INTERVAL);
@@ -771,14 +1116,32 @@ function stopTimers() {
         clearInterval(browserRestartTimer);
         browserRestartTimer = null;
     }
+    stopWatchdog();
 }
 
 // Verbesserte Hauptschleife mit besserer Fehlerbehandlung
-function start() {
+async function start() {
     logger.info("🚀 Starting lidl-extender script v" + version);
+
+    // Killen von existierenden Playwright-Prozessen beim Start (nur wenn aktiviert)
+    if (killExistingProcesses) {
+        logger.info("Prüfe auf existierende Playwright-Prozesse (KILL_EXISTING_PROCESSES=true)...");
+        await killExistingPlaywright();
+    } else {
+        logger.info("Überspringen: KILL_EXISTING_PROCESSES=false (keine Prozesse werden gekillt)");
+    }
+
+    // Killen von existierenden script.js-Instanzen beim Start (nur wenn aktiviert)
+    if (killScriptInstances) {
+        logger.info("Prüfe auf existierende script.js-Instanzen (KILL_SCRIPT_INSTANCES=true)...");
+        await killExistingScriptInstances();
+    } else {
+        logger.info("Überspringen: KILL_SCRIPT_INSTANCES=false (alte Instanzen werden NICHT gekillt)");
+    }
 
     // Starte alle Timer
     startTimers();
+    startWatchdog(); // Watchdog für Deadlock/CPU-Überwachung
 
     let mainTimeout = null;
 
@@ -903,7 +1266,7 @@ process.on('uncaughtException', (error) => {
 
 // Starte das Script
 try {
-    start();
+    await start();
 } catch (error) {
     logger.error(`Fehler beim Starten: ${error.message}`);
     sendMessage(`🚨 Fehler beim Starten: ${error.message}`, "error");
