@@ -167,6 +167,13 @@ class CircuitBreaker {
             logger.error(`Circuit breaker OPEN nach ${this.failureCount} Fehlern`);
         }
     }
+
+    reset() {
+        this.failureCount = 0;
+        this.lastFailureTime = null;
+        this.state = 'CLOSED';
+        logger.info('Circuit breaker zurückgesetzt');
+    }
 }
 
 const circuitBreaker = new CircuitBreaker(MAX_CONSECUTIVE_ERRORS, 5 * 60 * 1000);
@@ -555,6 +562,8 @@ async function restartBrowser() {
         if (success) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
+            loginAttempts = 0;
+            circuitBreaker.reset();
             updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
             logger.info("Browser erfolgreich neu gestartet");
             sendMessage("🔄 Browser wurde neu gestartet", "info");
