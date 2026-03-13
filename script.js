@@ -36,7 +36,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.3";
+const version = "1.2.4";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
