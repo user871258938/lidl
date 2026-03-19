@@ -36,7 +36,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.3";
+const version = "1.2.4";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -166,6 +166,13 @@ class CircuitBreaker {
             this.state = 'OPEN';
             logger.error(`Circuit breaker OPEN nach ${this.failureCount} Fehlern`);
         }
+    }
+
+    reset() {
+        this.failureCount = 0;
+        this.lastFailureTime = null;
+        this.state = 'CLOSED';
+        logger.info('Circuit breaker zurückgesetzt');
     }
 }
 
@@ -555,6 +562,8 @@ async function restartBrowser() {
         if (success) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
+            loginAttempts = 0;
+            circuitBreaker.reset();
             updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
             logger.info("Browser erfolgreich neu gestartet");
             sendMessage("🔄 Browser wurde neu gestartet", "info");
