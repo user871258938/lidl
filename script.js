@@ -11,7 +11,6 @@ if (!process.env.RUFNUMMER || !process.env.PASSWORD) {
 
 import * as fs from "fs";
 import { exec } from "child_process";
-import os from "os";
 
 const logger = createLogger("lidl-extender");
 
@@ -36,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.4";
+const version = "1.2.5";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -388,7 +387,7 @@ function getMemoryUsage() {
     };
 }
 
-function checkMemoryUsage() {
+async function checkMemoryUsage() {
     const memory = getMemoryUsage();
     logger.info(`Memory usage: RSS=${memory.rss}MB, Heap=${memory.heapUsed}/${memory.heapTotal}MB`);
 
@@ -405,7 +404,7 @@ function checkMemoryUsage() {
         // Browser restart bei kritischem Speicherverbrauch
         if (memory.rss > MAX_MEMORY_MB * 1.5) {
             logger.error("Kritischer Speicherverbrauch - Browser restart");
-            restartBrowser();
+            await restartBrowser();
         }
     }
 }
@@ -423,77 +422,6 @@ function saveSessionMeta() {
         fs.writeFileSync(sessionMetaFile, JSON.stringify(sessionMeta, null, 2));
     } catch (error) {
         logger.warn(`Fehler beim Speichern der Session-Metadaten: ${error.message}`);
-    }
-}
-
-function loadSessionMeta() {
-    try {
-        if (fs.existsSync(sessionMetaFile)) {
-            return JSON.parse(fs.readFileSync(sessionMetaFile, 'utf-8'));
-        }
-    } catch (error) {
-        logger.warn(`Fehler beim Laden der Session-Metadaten: ${error.message}`);
-    }
-    return null;
-}
-
-function isSessionExpired() {
-    const sessionMeta = loadSessionMeta();
-    if (!sessionMeta) return true;
-
-    const timeSinceLastActivity = Date.now() - sessionMeta.lastActivity;
-    const timeSinceBrowserRestart = Date.now() - (sessionMeta.browserRestartTime || 0);
-
-    return timeSinceLastActivity > SESSION_TIMEOUT ||
-        timeSinceBrowserRestart > BROWSER_RESTART_INTERVAL;
-}
-
-// Verbesserte Session-Validierung mit Timeout
-async function validateSession() {
-    if (isShuttingDown) return false;
-
-    try {
-        if (!page || page.isClosed()) {
-            logger.warn("Seite ist geschlossen, Session ungültig");
-            return false;
-        }
-
-        // Timeout für die gesamte Validierung
-        const validationPromise = (async () => {
-            const currentUrl = page.url();
-            if (currentUrl.includes('login') || currentUrl.includes('anmelden')) {
-                logger.warn("Auf Login-Seite weitergeleitet, Session ungültig");
-                return false;
-            }
-
-            await page.goto(uebersichtUrl, {
-                waitUntil: "domcontentloaded",
-                timeout: 15000
-            });
-            await delay(2000);
-
-            const loginFormExists = await page.$('input[name="msisdn"]') !== null;
-            if (loginFormExists) {
-                logger.warn("Login-Formular gefunden, Session ungültig");
-                return false;
-            }
-
-            await page.waitForSelector(".app-consumptions .progress-wrapper label.unit-display", { timeout: 10000 });
-			logger.info("Session-Validierung erfolgreich");
-			lastActivityTime = Date.now();
-			saveSessionMeta();
-			return true;
-		})();
-
-        return await Promise.race([
-            validationPromise,
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Session validation timeout')), 30000)
-            )
-        ]);
-    } catch (error) {
-        logger.error(`Fehler bei Session-Validierung: ${error.message}`);
-        return false;
     }
 }
 
@@ -620,8 +548,7 @@ async function initializeBrowser() {
             ],
             userAgent: fingerprint.userAgent,
             locale: fingerprint.locale,
-            timezoneId: fingerprint.timezoneId,
-            storageState: fs.existsSync(cookiefile) ? cookiefile : undefined
+            timezoneId: fingerprint.timezoneId
         };
 
         context = await playwright[browserType].launchPersistentContext(
@@ -633,14 +560,13 @@ async function initializeBrowser() {
         page = await context.newPage();
 
         // Setze Viewport und Device-Properties basierend auf generierter Fingerprint
-        const fingerprint2 = generateFingerprint();
-        await page.setViewportSize(fingerprint2.viewport);
+        await page.setViewportSize(fingerprint.viewport);
         await page.addInitScript(`
             Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => ${fingerprint2.deviceMemory}
+                get: () => ${fingerprint.deviceMemory}
             });
             Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => ${fingerprint2.hardwareConcurrency}
+                get: () => ${fingerprint.hardwareConcurrency}
             });
         `);
 
@@ -750,7 +676,7 @@ async function performLogin() {
 
 // Verbesserte Hauptfunktion mit Circuit Breaker
 async function main() {
-    if (isShuttingDown) return 0;
+    if (isShuttingDown) return { datenVolumen: 0, statusMessage: null };
 
     let datenVolumen = 0.0;
 
@@ -841,7 +767,7 @@ async function main() {
 					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
 				}
 				
-				return 0; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
+				return { datenVolumen: 0, statusMessage: null }; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
 			}
 
 			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
@@ -899,7 +825,7 @@ async function main() {
                         
                         // Erfolgs-Nachricht sofort senden
                         let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
-                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / 25 GB\n`;
+                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB\n`;
                         successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
                         sendMessage(successMessage, "info");
                     } else {
@@ -912,21 +838,22 @@ async function main() {
             }
 
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
-            datenVolumen = datenVerfuegbar + refillVerfuegbar;
+            datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
             lastActivityTime = Date.now();
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
-                // Send status update with volumes (nur wenn kein Refill durchgeführt wurde)
-                if (!nachbuchungsErfolg) {
-                    let finalStatusMessage = tarifMessage;
-                    if (!isNaN(refillVerfuegbar)) {
-                        finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
-                    }
-                    sendMessage(finalStatusMessage, "info");
+            // Sende kombinierte Status-Nachricht (nur wenn kein Refill durchgeführt wurde)
+            if (!nachbuchungsErfolg) {
+                let finalStatusMessage = `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB`;
+                if (!isNaN(refillVerfuegbar)) {
+                    finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} GB / ${usage.refill.total} GB`;
                 }
+                // Interval wird später in runMain() angehängt und gesendet
+                return { datenVolumen, statusMessage: finalStatusMessage };
+            }
 
-            return datenVolumen;
+            return { datenVolumen, statusMessage: null };
         });
 
     } catch (error) {
@@ -940,7 +867,7 @@ async function main() {
             await restartBrowser();
         }
 
-        return 0;
+        return { datenVolumen: 0, statusMessage: null };
     }
 }
 
@@ -949,7 +876,7 @@ async function checkForUpdates() {
     try {
         const response = await axios.get(updateUrl);
         const latestVersion = response.data.version;
-        if (latestVersion > version) {
+        if (latestVersion.localeCompare(version, undefined, { numeric: true }) > 0) {
             logger.warn(`New version available: ${latestVersion}. Updating the script...`);
             if (autoUpdate) {
                 const scriptPath = 'script.js';
@@ -1158,6 +1085,7 @@ async function start() {
         if (isShuttingDown) return;
 
         let datenVolumen = 0;
+        let statusMessage = null;
         let nextInterval = 300; // Default 5 Minuten
 
         try {
@@ -1167,7 +1095,9 @@ async function start() {
             }
 
             // Hauptfunktion ausführen
-            datenVolumen = await main();
+            const result = await main();
+            datenVolumen = result.datenVolumen;
+            statusMessage = result.statusMessage;
 
             // Reset consecutive errors bei Erfolg
             if (datenVolumen > 0) {
@@ -1203,7 +1133,12 @@ async function start() {
             if (datenVolumen !== 0) {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
                 logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
-                sendMessage(`📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`, "info");
+
+                // Sende kombinierte Telegram-Nachricht mit korrektem Interval
+                if (statusMessage) {
+                    statusMessage += `\n\n📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`;
+                    sendMessage(statusMessage, "info");
+                }
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
             }
