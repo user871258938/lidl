@@ -122,6 +122,9 @@ const HIGH_CPU_DURATION = 30000; // 30 Sekunden
 let nanErrorCount = 0;
 const MAX_NAN_ERRORS = 3;
 
+// Zeitpunkt des letzten erfolgreichen main()-Laufs (für Keep-Alive-Throttling)
+let lastMainRunTime = 0;
+
 // Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
 let lastTelegramStatusMessageId = null;
 
@@ -431,6 +434,14 @@ function saveSessionMeta() {
 // Verbessertes Keep-Alive mit Fehlerbehandlung
 async function keepSessionAlive() {
     if (!page || page.isClosed() || isShuttingDown) return;
+
+    // Skip wenn main() kürzlich gelaufen ist (verhindert Rate-Limit durch Doppel-Requests)
+    const timeSinceLastMain = Date.now() - lastMainRunTime;
+    if (timeSinceLastMain < SESSION_KEEPALIVE_INTERVAL) {
+        logger.debug(`Keep-Alive übersprungen - main() lief vor ${Math.round(timeSinceLastMain / 1000)}s`);
+        updateHeartbeat();
+        return;
+    }
 
     try {
         const keepAlivePromise = (async () => {
@@ -795,6 +806,16 @@ async function main() {
 					}
 				}
 
+				// Rate-Limit-Erkennung: Lidl zeigt Platzhaltertext statt echter Daten
+				if (isNaN(result.tarif.available)) {
+					const rateLimitText = 'Im aktuellen Tarif sind keine Inklusiv-Einheiten';
+					const pageText = document.body.innerText || '';
+					if (pageText.includes(rateLimitText)) {
+						result._rateLimited = true;
+						return result;
+					}
+				}
+
 				// Debug: Alle unit-display Elemente loggen falls nichts gefunden
 				if (isNaN(result.tarif.available)) {
 					const allLabels = Array.from(document.querySelectorAll('.unit-display, [class*="consumption"], [class*="data-volume"]'));
@@ -816,6 +837,14 @@ async function main() {
 			
 			let datenVerfuegbar = usage.tarif.available;
 			let refillVerfuegbar = usage.refill.available;
+
+			// Rate-Limit-Erkennung: Lidl zeigt Platzhaltertext wenn zu viele Anfragen
+			if (usage._rateLimited) {
+				logger.warn("⏳ Rate-Limit erkannt - Lidl zeigt keine Verbrauchsdaten. Warte 3 Minuten...");
+				sendMessage("⏳ Rate-Limit: Lidl-Server antwortet mit leerem Verbrauch - Pause 3 Minuten", "warn");
+				await delay(3 * 60 * 1000);
+				return { datenVolumen: 0, statusMessage: null };
+			}
 
 			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
 			if (isNaN(datenVerfuegbar)) {
@@ -916,6 +945,7 @@ async function main() {
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
             datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
             lastActivityTime = Date.now();
+            lastMainRunTime = Date.now(); // Keep-Alive-Throttling
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
