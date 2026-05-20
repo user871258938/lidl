@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.5";
+const version = "1.2.6";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -842,6 +842,7 @@ async function main() {
 			if (usage._rateLimited) {
 				logger.warn("⏳ Rate-Limit erkannt - Lidl zeigt keine Verbrauchsdaten. Warte 3 Minuten...");
 				sendMessage("⏳ Rate-Limit: Lidl-Server antwortet mit leerem Verbrauch - Pause 3 Minuten", "warn");
+				lastMainRunTime = Date.now(); // Keep-Alive während Backoff unterdrücken
 				await delay(3 * 60 * 1000);
 				return { datenVolumen: 0, statusMessage: null };
 			}
