@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.6";
+const version = "1.2.7";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -124,6 +124,10 @@ const MAX_NAN_ERRORS = 3;
 
 // Zeitpunkt des letzten erfolgreichen main()-Laufs (für Keep-Alive-Throttling)
 let lastMainRunTime = 0;
+
+// Rate-Limit exponentieller Backoff
+let rateLimitBackoffCount = 0;
+let rateLimitBackoffUntil = 0;
 
 // Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
 let lastTelegramStatusMessageId = null;
@@ -434,6 +438,14 @@ function saveSessionMeta() {
 // Verbessertes Keep-Alive mit Fehlerbehandlung
 async function keepSessionAlive() {
     if (!page || page.isClosed() || isShuttingDown) return;
+
+    // Skip während aktivem Rate-Limit-Backoff
+    if (Date.now() < rateLimitBackoffUntil) {
+        const remainingSec = Math.round((rateLimitBackoffUntil - Date.now()) / 1000);
+        logger.debug(`Keep-Alive übersprungen - Rate-Limit Backoff aktiv, noch ${remainingSec}s`);
+        updateHeartbeat();
+        return;
+    }
 
     // Skip wenn main() kürzlich gelaufen ist (verhindert Rate-Limit durch Doppel-Requests)
     const timeSinceLastMain = Date.now() - lastMainRunTime;
@@ -840,11 +852,13 @@ async function main() {
 
 			// Rate-Limit-Erkennung: Lidl zeigt Platzhaltertext wenn zu viele Anfragen
 			if (usage._rateLimited) {
-				logger.warn("⏳ Rate-Limit erkannt - Lidl zeigt keine Verbrauchsdaten. Warte 3 Minuten...");
-				sendMessage("⏳ Rate-Limit: Lidl-Server antwortet mit leerem Verbrauch - Pause 3 Minuten", "warn");
-				lastMainRunTime = Date.now(); // Keep-Alive während Backoff unterdrücken
-				await delay(3 * 60 * 1000);
-				return { datenVolumen: 0, statusMessage: null };
+				rateLimitBackoffCount++;
+				const backoffMinutes = Math.min(3 * Math.pow(2, rateLimitBackoffCount - 1), 30);
+				rateLimitBackoffUntil = Date.now() + backoffMinutes * 60 * 1000;
+				lastMainRunTime = Date.now();
+				logger.warn(`⏳ Rate-Limit erkannt (${rateLimitBackoffCount}x) - Warte ${backoffMinutes} Minuten...`);
+				sendMessage(`⏳ Rate-Limit erkannt (${rateLimitBackoffCount}x) - Pause ${backoffMinutes} Minuten`, "warn");
+				return { datenVolumen: 0, statusMessage: null, rateLimitBackoffSeconds: backoffMinutes * 60 };
 			}
 
 			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
@@ -947,6 +961,8 @@ async function main() {
             datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
             lastActivityTime = Date.now();
             lastMainRunTime = Date.now(); // Keep-Alive-Throttling
+            rateLimitBackoffCount = 0; // Backoff zurücksetzen nach erfolgreichem Lesen
+            rateLimitBackoffUntil = 0;
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
@@ -1108,7 +1124,7 @@ const getRandomInteger = (min, max) => {
 
 function getInterval(daten) {
     if (daten === 0) {
-        return 60; // Mindestens 1 Minute bei Fehlern
+        return 300; // 5 Minuten bei Fehlern (nicht Rate-Limit - das wird separat behandelt)
     }
     if (sleepmode === "random") {
         return getRandomInteger(300, 500);
@@ -1143,7 +1159,7 @@ function getSmartInterval(Datenvolumen) {
     } else if (Datenvolumen >= 1.0) {
         return getRandomInteger(45, 60);      // max 60s  × 6,25 MB/s ≈ 0,37 GB < 1,0 GB ✓
     } else {
-        return 45;
+        return 70; // Minimum 70s auch bei sehr niedrigem Volumen
     }
 }
 
@@ -1244,6 +1260,11 @@ async function start() {
             statusMessage = result.statusMessage;
             forceNewMessage = result.forceNewMessage ?? false;
 
+            // Rate-Limit Backoff als Interval verwenden
+            if (result.rateLimitBackoffSeconds) {
+                nextInterval = result.rateLimitBackoffSeconds;
+            }
+
             // Reset consecutive errors bei Erfolg
             if (datenVolumen > 0) {
                 consecutiveErrors = 0;
@@ -1272,7 +1293,12 @@ async function start() {
         // Nächsten Lauf planen
         if (!isShuttingDown) {
             if (nextInterval === 300) { // Nur wenn kein Fehler-Interval gesetzt wurde
-                nextInterval = getInterval(datenVolumen);
+                // Aktiven Rate-Limit-Backoff berücksichtigen
+                if (rateLimitBackoffUntil > Date.now()) {
+                    nextInterval = Math.ceil((rateLimitBackoffUntil - Date.now()) / 1000);
+                } else {
+                    nextInterval = getInterval(datenVolumen);
+                }
             }
 
             if (datenVolumen !== 0) {
