@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.7";
+const version = "1.2.8";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -1154,12 +1154,10 @@ function getSmartInterval(Datenvolumen) {
         return getRandomInteger(180, 300);    // max 300s × 6,25 MB/s ≈ 1,9 GB < 3 GB ✓
     } else if (Datenvolumen >= 2) {
         return getRandomInteger(90, 150);     // max 150s × 6,25 MB/s ≈ 0,9 GB < 2 GB ✓
-    } else if (Datenvolumen >= 1.2) {
-        return getRandomInteger(60, 90);      // max 90s  × 6,25 MB/s ≈ 0,56 GB < 1,2 GB ✓
     } else if (Datenvolumen >= 1.0) {
-        return getRandomInteger(45, 60);      // max 60s  × 6,25 MB/s ≈ 0,37 GB < 1,0 GB ✓
+        return getRandomInteger(90, 120);     // max 120s × 6,25 MB/s ≈ 0,75 GB < 1,0 GB ✓
     } else {
-        return 70; // Minimum 70s auch bei sehr niedrigem Volumen
+        return getRandomInteger(70, 90);      // Minimum bei sehr niedrigem Volumen
     }
 }
 
@@ -1255,6 +1253,7 @@ async function start() {
             }
 
             // Hauptfunktion ausführen
+            lastMainRunTime = Date.now(); // Keep-Alive nach jedem Lauf drosseln (unabhängig vom Ergebnis)
             const result = await main();
             datenVolumen = result.datenVolumen;
             statusMessage = result.statusMessage;
