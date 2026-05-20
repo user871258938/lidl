@@ -122,6 +122,9 @@ const HIGH_CPU_DURATION = 30000; // 30 Sekunden
 let nanErrorCount = 0;
 const MAX_NAN_ERRORS = 3;
 
+// Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
+let lastTelegramStatusMessageId = null;
+
 // Circuit Breaker Pattern
 class CircuitBreaker {
     constructor(threshold = 5, timeout = 60000) {
@@ -633,13 +636,29 @@ async function performLogin() {
             // Login-Button klicken und auf Navigation warten
             await Promise.all([
                 page.click('button[type="submit"]:has-text("Einloggen")'),
-                page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 })
+                page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 })
             ]);
 
+            // Warte bis Redirect abgeschlossen und Vue initialisiert ist
             await delay(3000);
+            try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch (_) {}
+            await delay(1000);
+
             const currentUrl = page.url();
-            if (!currentUrl.startsWith(uebersichtUrl)) {
+            // Akzeptiere auch /mein-lidl-connect/ als valide post-login URL (falls Lidl Redirect geändert)
+            if (!currentUrl.includes("mein-lidl-connect")) {
                 throw new Error(`Login fehlgeschlagen, unerwartete URL: ${currentUrl}`);
+            }
+
+            // Falls auf Übersichtsseite umgeleitet, gut - sonst manuell navigieren
+            if (!currentUrl.startsWith(uebersichtUrl)) {
+                logger.info(`Post-login URL: ${currentUrl} - navigiere zu Übersicht`);
+                await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+                await delay(2000);
+                const urlNachNav = page.url();
+                if (!urlNachNav.includes("mein-lidl-connect")) {
+                    throw new Error(`Navigation zur Übersicht fehlgeschlagen: ${urlNachNav}`);
+                }
             }
 
             // Speichere Session-Daten
@@ -697,76 +716,123 @@ async function main() {
                 throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
             }
 
-            // Stelle sicher, dass wir auf der Übersichtsseite sind
-            if (!page.url().startsWith(uebersichtUrl)) {
-                await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-                await delay(2000);
-            }
+            // Seite immer neu laden für aktuelle Daten
+            await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
 
-            // Warte auf Datenvolumen-Element bevor wir extrahieren
+            // Auf vollständiges Rendern der Vue-Komponenten warten (Netzwerk + DOM)
             try {
-                await page.waitForFunction(() => {
-                    const element = document.querySelector('label[for="DATA"].unit-display');
-                    return element && element.textContent.trim().length > 0;
-                }, { timeout: 15000 });
-                logger.debug("Datenvolumen-Element gefunden und bereit");
-            } catch (error) {
-                logger.warn(`Datenvolumen-Element nicht gefunden: ${error.message}`);
+                await page.waitForLoadState("networkidle", { timeout: 20000 });
+            } catch (_) {
+                logger.debug("networkidle Timeout - fahre trotzdem fort");
             }
 
-            await delay(1000); // Zusätzliche kurze Wartezeit
+            // Warte bis die app-consumptions-v2 Komponente im DOM ist
+            try {
+                await page.waitForSelector('app-consumptions-v2, app-consumptions', { timeout: 15000 });
+                logger.debug("Consumption-Komponente im DOM gefunden");
+            } catch (error) {
+                logger.warn(`Consumption-Komponente nicht gefunden: ${error.message}`);
+            }
+
+            // Extra-Wartezeit damit Vue die Labels rendern kann
+            await delay(3000);
 
 			// Datenvolumen auslesen (Tarif + Refill)
+			// Versuche mehrere Selector-Varianten für alte und neue Seitenstruktur
 			const usage = await page.evaluate(() => {
 				const result = {
 					tarif: { available: NaN, total: NaN, unit: '' },
 					refill: { available: NaN, total: NaN, unit: '' }
 				};
 
-				// Get Tarif data (DATA id)
-				const tarifLabel = document.querySelector('label[for="DATA"].unit-display');
-				if (tarifLabel) {
-					const text = tarifLabel.textContent.trim();
+				function parseLabel(el) {
+					if (!el) return null;
+					const text = el.textContent.trim();
 					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.tarif.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.tarif.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = tarifLabel.querySelector('span.unit');
-					result.tarif.unit = unitEl ? unitEl.textContent.trim() : '';
+					const unitEl = el.querySelector('span.unit') || el.closest('[class*="unit"]');
+					const unit = unitEl ? unitEl.textContent.replace(/\d+[.,]?\d*/g, '').trim()
+						: (text.match(/[A-Za-z]+/) || [''])[0];
+					return {
+						available: nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN,
+						total: nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN,
+						unit
+					};
 				}
 
-				// Get Refill data (REFILLABLE_DATA id) - optional, may not always be present
-				const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-				if (refillLabel) {
-					const text = refillLabel.textContent.trim();
-					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.refill.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.refill.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = refillLabel.querySelector('span.unit');
-					result.refill.unit = unitEl ? unitEl.textContent.trim() : '';
+				// Versuche Tarif-Daten - alte und neue Selektor-Varianten
+				const tarifCandidates = [
+					document.querySelector('label[for="DATA"].unit-display'),
+					document.querySelector('app-consumptions-v2 label[for="DATA"]'),
+					document.querySelector('app-consumptions-v2 .unit-display'),
+					document.querySelector('app-consumptions label[for="DATA"]'),
+					document.querySelector('app-consumptions .unit-display'),
+					document.querySelector('[data-type="DATA"] .unit-display'),
+					document.querySelector('[data-type="DATA"]'),
+				];
+				for (const el of tarifCandidates) {
+					const parsed = parseLabel(el);
+					if (parsed && !isNaN(parsed.available)) {
+						result.tarif = parsed;
+						break;
+					}
+				}
+
+				// Versuche Refill-Daten - alte und neue Selektor-Varianten
+				const refillCandidates = [
+					document.querySelector('label[for="REFILLABLE_DATA"].unit-display'),
+					document.querySelector('app-consumptions-refill-v2 label[for="REFILLABLE_DATA"]'),
+					document.querySelector('app-consumptions-refill-v2 .unit-display'),
+					document.querySelector('app-consumptions-refill label[for="REFILLABLE_DATA"]'),
+					document.querySelector('app-consumptions-refill .unit-display'),
+					document.querySelector('[data-type="REFILLABLE_DATA"] .unit-display'),
+					document.querySelector('[data-type="REFILLABLE_DATA"]'),
+				];
+				for (const el of refillCandidates) {
+					const parsed = parseLabel(el);
+					if (parsed && !isNaN(parsed.available)) {
+						result.refill = parsed;
+						break;
+					}
+				}
+
+				// Debug: Alle unit-display Elemente loggen falls nichts gefunden
+				if (isNaN(result.tarif.available)) {
+					const allLabels = Array.from(document.querySelectorAll('.unit-display, [class*="consumption"], [class*="data-volume"]'));
+					result._debugSelectors = allLabels.slice(0, 10).map(el => ({
+						tag: el.tagName,
+						classes: el.className,
+						for: el.getAttribute('for'),
+						text: el.textContent.trim().substring(0, 80)
+					}));
 				}
 
 				return result;
 			});
+
+			// Debug-Ausgabe falls Tarif-Daten fehlen
+			if (isNaN(usage.tarif.available) && usage._debugSelectors) {
+				logger.warn(`Keine bekannten Selektoren gefunden. Gefundene DOM-Elemente: ${JSON.stringify(usage._debugSelectors)}`);
+			}
 			
 			let datenVerfuegbar = usage.tarif.available;
 			let refillVerfuegbar = usage.refill.available;
 
 			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
 			if (isNaN(datenVerfuegbar)) {
-				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount + 1}/${MAX_NAN_ERRORS}`);
 				nanErrorCount++;
-				
+				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount}/${MAX_NAN_ERRORS}`);
+				sendMessage(`⚠️ Datenvolumen nicht lesbar (${nanErrorCount}/${MAX_NAN_ERRORS}) - Seite wird neu geladen`, "warn");
+
 				if (nanErrorCount >= MAX_NAN_ERRORS) {
-					logger.error("Zu viele NaN-Fehler - Logout und Neustart");
-					sendMessage("⚠️ Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
-					
-					// Browser komplett neu starten (löscht alles und loggt aus)
+					logger.error("Zu viele NaN-Fehler - Browser wird neu gestartet");
+					sendMessage("🚨 Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
+
 					await restartBrowser();
 					nanErrorCount = 0;
-					
+
 					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
 				}
-				
+
 				return { datenVolumen: 0, statusMessage: null }; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
 			}
 
@@ -787,6 +853,7 @@ async function main() {
 
             // Nachbuchung falls nötig (unter 0.8 GB vom Refill Volumen)
             let nachbuchungsErfolg = false;
+            let refillSuccessMessage = null;
             if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8)) {
                 try {
                     logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
@@ -797,18 +864,28 @@ async function main() {
                     
                     // Seite neu laden und Refill-Volumen neu prüfen
                     await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-                    await delay(2000);
+                    try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch (_) {}
+                    await delay(3000);
                     
                     const usageNach = await page.evaluate(() => {
                         const result = { available: NaN, total: NaN, unit: '' };
-                        const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-                        if (refillLabel) {
-                            const text = refillLabel.textContent.trim();
+                        const candidates = [
+                            document.querySelector('label[for="REFILLABLE_DATA"].unit-display'),
+                            document.querySelector('app-consumptions-refill-v2 label[for="REFILLABLE_DATA"]'),
+                            document.querySelector('app-consumptions-refill-v2 .unit-display'),
+                            document.querySelector('app-consumptions-refill .unit-display'),
+                        ];
+                        for (const el of candidates) {
+                            if (!el) continue;
+                            const text = el.textContent.trim();
                             const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-                            result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-                            result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-                            const unitEl = refillLabel.querySelector('span.unit');
-                            result.unit = unitEl ? unitEl.textContent.trim() : '';
+                            if (nums[0]) {
+                                result.available = parseFloat(nums[0].replace(',', '.'));
+                                result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+                                const unitEl = el.querySelector('span.unit');
+                                result.unit = unitEl ? unitEl.textContent.trim() : '';
+                                break;
+                            }
                         }
                         return result;
                     });
@@ -823,11 +900,10 @@ async function main() {
                         // Aktualisiere refillVerfuegbar mit neuem Wert für korrekte Berechnung
                         refillVerfuegbar = refillNachher;
                         
-                        // Erfolgs-Nachricht sofort senden
-                        let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
-                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB\n`;
-                        successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
-                        sendMessage(successMessage, "info");
+                        // Erfolgs-Nachricht vorbereiten (Interval wird in runMain() angehängt)
+                        refillSuccessMessage = `✅ Refill erfolgreich aktiviert!\n`;
+                        refillSuccessMessage += `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB\n`;
+                        refillSuccessMessage += `📊 Refill: ${refillVorher} GB → ${refillNachher} GB`;
                     } else {
                         logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
@@ -843,17 +919,16 @@ async function main() {
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
-            // Sende kombinierte Status-Nachricht (nur wenn kein Refill durchgeführt wurde)
-            if (!nachbuchungsErfolg) {
-                let finalStatusMessage = `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB`;
-                if (!isNaN(refillVerfuegbar)) {
-                    finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} GB / ${usage.refill.total} GB`;
-                }
-                // Interval wird später in runMain() angehängt und gesendet
-                return { datenVolumen, statusMessage: finalStatusMessage };
+            // Rückgabe: Refill-Nachricht oder normaler Status (Interval wird in runMain() angehängt)
+            if (nachbuchungsErfolg) {
+                return { datenVolumen, statusMessage: refillSuccessMessage, forceNewMessage: true };
             }
 
-            return { datenVolumen, statusMessage: null };
+            let finalStatusMessage = `📊 Tarif: ${datenVerfuegbar} GB / ${usage.tarif.total} GB`;
+            if (!isNaN(refillVerfuegbar)) {
+                finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} GB / ${usage.refill.total} GB`;
+            }
+            return { datenVolumen, statusMessage: finalStatusMessage, forceNewMessage: false };
         });
 
     } catch (error) {
@@ -904,9 +979,44 @@ async function checkForUpdates() {
     }
 }
 
+// Telegram Status-Nachricht: alte löschen, neue senden (immer aktueller Zeitstempel sichtbar)
+async function sendOrEditStatusMessage(message) {
+    if (!telegramAllow || !telegramToken || !telegramChatId || isShuttingDown) return;
+    if (infoLevel !== "info") return;
+
+    // Alte Nachricht löschen
+    if (lastTelegramStatusMessageId) {
+        try {
+            await axios.post(`https://api.telegram.org/bot${telegramToken}/deleteMessage`, {
+                chat_id: telegramChatId,
+                message_id: lastTelegramStatusMessageId
+            });
+        } catch (_) { /* Nachricht bereits gelöscht oder zu alt - ignorieren */ }
+        lastTelegramStatusMessageId = null;
+    }
+
+    // Neue Nachricht senden
+    try {
+        const res = await axios.post(telegramApiUrl, {
+            chat_id: telegramChatId,
+            text: message,
+            parse_mode: "HTML"
+        });
+        lastTelegramStatusMessageId = res.data?.result?.message_id ?? null;
+        logger.info(`Telegram Statusnachricht gesendet`);
+    } catch (err) {
+        logger.error(`Failed to send Telegram message: ${err.message}`);
+    }
+}
+
 // Verbesserte Nachrichtenfunktion
 function sendMessage(message, level) {
     if (isShuttingDown) return;
+
+    // Bei Fehler/Warnung: Status-ID zurücksetzen (nächste Status-Msg sendet als neue Nachricht)
+    if (level === "error" || level === "warn") {
+        lastTelegramStatusMessageId = null;
+    }
 
     if (telegramAllow && telegramToken && telegramChatId) {
         const shouldSend = (level === "error") ||
@@ -987,20 +1097,22 @@ function getInterval(daten) {
 }
 
 function getSmartInterval(Datenvolumen) {
+    // Intervals kalibriert für max. 50 Mbit/s (= 6,25 MB/s):
+    // Max-Interval × 6,25 MB/s < verbleibendes Volumen → Daten laufen nie zwischen zwei Prüfungen aus
     if (Datenvolumen >= 10) {
-        return getRandomInteger(3600, 5400);
+        return getRandomInteger(600, 900);    // max 900s × 6,25 MB/s ≈ 5,6 GB < 10 GB ✓
     } else if (Datenvolumen >= 5) {
-        return getRandomInteger(900, 1800);
+        return getRandomInteger(300, 480);    // max 480s × 6,25 MB/s ≈ 3,0 GB < 5 GB ✓
     } else if (Datenvolumen >= 3) {
-        return getRandomInteger(600, 900);
+        return getRandomInteger(180, 300);    // max 300s × 6,25 MB/s ≈ 1,9 GB < 3 GB ✓
     } else if (Datenvolumen >= 2) {
-        return getRandomInteger(300, 450);
+        return getRandomInteger(90, 150);     // max 150s × 6,25 MB/s ≈ 0,9 GB < 2 GB ✓
     } else if (Datenvolumen >= 1.2) {
-        return getRandomInteger(150, 240);
+        return getRandomInteger(60, 90);      // max 90s  × 6,25 MB/s ≈ 0,56 GB < 1,2 GB ✓
     } else if (Datenvolumen >= 1.0) {
-        return getRandomInteger(60, 90);
+        return getRandomInteger(45, 60);      // max 60s  × 6,25 MB/s ≈ 0,37 GB < 1,0 GB ✓
     } else {
-        return 60;
+        return 45;
     }
 }
 
@@ -1086,6 +1198,7 @@ async function start() {
 
         let datenVolumen = 0;
         let statusMessage = null;
+        let forceNewMessage = false;
         let nextInterval = 300; // Default 5 Minuten
 
         try {
@@ -1098,6 +1211,7 @@ async function start() {
             const result = await main();
             datenVolumen = result.datenVolumen;
             statusMessage = result.statusMessage;
+            forceNewMessage = result.forceNewMessage ?? false;
 
             // Reset consecutive errors bei Erfolg
             if (datenVolumen > 0) {
@@ -1134,10 +1248,15 @@ async function start() {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
                 logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
 
-                // Sende kombinierte Telegram-Nachricht mit korrektem Interval
+                // Sende oder aktualisiere Telegram-Nachricht mit korrektem Interval
                 if (statusMessage) {
-                    statusMessage += `\n\n📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`;
-                    sendMessage(statusMessage, "info");
+                    statusMessage += `\n⏰ Nächste Prüfung in ${nextInterval} Sekunden.`;
+                    if (forceNewMessage) {
+                        lastTelegramStatusMessageId = null;
+                        sendMessage(statusMessage, "info");
+                    } else {
+                        sendOrEditStatusMessage(statusMessage);
+                    }
                 }
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
