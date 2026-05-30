@@ -834,7 +834,7 @@ async function main() {
             }
 
             // Login durchführen (bei forceClean=true neu, bei forceClean=false Session wiederverwenden)
-            logger.info("Führe Login durch...");
+            logger.info("Prüfe Session...");
             const loginSuccess = await performLogin();
             if (!loginSuccess) {
                 throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
