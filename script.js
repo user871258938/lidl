@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.3.5";
+const version = "1.3.6";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -125,12 +125,18 @@ const MAX_NAN_ERRORS = 3;
 // Zeitpunkt des letzten erfolgreichen main()-Laufs (für Keep-Alive-Throttling)
 let lastMainRunTime = 0;
 
+// Erwarteter Zeitpunkt des nächsten runMain()-Aufrufs (geplanter Sleep - verhindert Watchdog-Fehlalarme)
+let nextScheduledRun = 0;
+
 // Rate-Limit exponentieller Backoff
 let rateLimitBackoffCount = 0;
 let rateLimitBackoffUntil = 0;
 
 // Letztes bekanntes Datenvolumen für Download-Erkennung
 let prevDatenVolumen = 0;  // unused, kept for future use
+
+// Aktueller Browser-Fingerprint (für konsistente Session-Wiederherstellung)
+let currentFingerprint = null;
 
 // Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
 let lastTelegramStatusMessageId = null;
@@ -220,7 +226,12 @@ function startWatchdog() {
         lastCpuCheck = now;
 
         // Deadlock-Erkennung: Kein Heartbeat für zu lange
+        // Ausnahme: Geplanter Sleep (Rate-Limit-Backoff, normales Interval) → kein Fehlalarm
         if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT) {
+            if (nextScheduledRun > 0 && now < nextScheduledRun + 30000) {
+                lastHeartbeat = now; // Heartbeat während geplantem Sleep auto-aktualisieren
+                return;
+            }
             logger.error(`🚨 WATCHDOG: Deadlock erkannt! Kein Heartbeat seit ${timeSinceLastHeartbeat}ms - Versuche Browser-Restart`);
             sendMessage(`🚨 WATCHDOG: Script scheint zu hängen (${timeSinceLastHeartbeat}ms kein Heartbeat) - Versuche Restart`, "warn");
             
@@ -357,24 +368,29 @@ async function killExistingPlaywright() {
                 }
             }
         } else if (isLinux || isMac) {
-            // Auf Linux/macOS: pgrep zum Zählen, dann pkill zum Killen
-            const browserProcesses = ['chrome', 'firefox', 'chromium', 'chromium-browser', 'google-chrome'];
-            
-            for (const processName of browserProcesses) {
-                try {
-                    // Zähle wie viele Prozesse gefunden wurden
-                    const output = execSync(`pgrep -f ${processName} 2>/dev/null || true`, { encoding: 'utf-8' });
-                    const count = output.trim().split('\n').filter(line => line.length > 0).length;
-                    
-                    if (count > 0) {
-                        // Killen
-                        execSync(`pkill -f ${processName} 2>/dev/null || true`, { stdio: 'pipe' });
-                        processesKilled += count;
-                        logger.info(`${count} ${processName}-Prozess(e) beendet`);
-                    }
-                } catch (err) {
-                    // Prozess nicht gefunden ist ok
+            // Schritt 1: Hauptprozesse via -no-remote Flag per SIGTERM beenden
+            // (gibt Firefox Chance, eigene Child-Prozesse sauber zu beenden)
+            try {
+                const output = execSync(`pgrep -f 'firefox.*-no-remote' 2>/dev/null || true`, { encoding: 'utf-8' });
+                const pids = output.trim().split('\n').filter(l => l.length > 0 && /^\d+$/.test(l.trim())).map(l => l.trim());
+                for (const pid of pids) {
+                    try {
+                        execSync(`kill ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
+                        processesKilled++;
+                        logger.info(`Firefox Hauptprozess ${pid} beendet`);
+                    } catch (_) {}
                 }
+            } catch (err) {
+                // keine Playwright-Prozesse gefunden
+            }
+
+            // Schritt 2: Verbleibende Child-Prozesse (contentproc, gpu, socket etc.) per SIGKILL bereinigen
+            // Nötig wenn der Hauptprozess durch SIGKILL starb und die Kinder bereits orphaned sind
+            if (processesKilled > 0) {
+                await delay(300);
+                try {
+                    execSync(`pkill -9 -f 'ms-playwright' 2>/dev/null || true`, { stdio: 'pipe' });
+                } catch (_) {}
             }
         }
 
@@ -566,9 +582,36 @@ async function initializeBrowser(forceClean = true) {
             logger.info("Browser-Neustart mit bestehender Session (keine Daten gelöscht)");
         }
 
-        // Generiere zufällige Fingerprint (außer locale/timezone)
-        const fingerprint = generateFingerprint();
-        logger.info(`🎭 Neue Browser-Fingerprint: UA=${fingerprint.userAgent.substring(0, 60)}..., Viewport=${fingerprint.viewport.width}x${fingerprint.viewport.height}, Memory=${fingerprint.deviceMemory}GB, Cores=${fingerprint.hardwareConcurrency}`);
+        // Fingerprint: bei Session-Reuse gespeicherten Fingerprint verwenden (konsistente Session), sonst neu generieren
+        let fingerprint = null;
+        if (!forceClean && fs.existsSync(cookiefile)) {
+            try {
+                const savedData = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                if (savedData._fingerprint) {
+                    fingerprint = { ...savedData._fingerprint, locale: 'de-DE', timezoneId: 'Europe/Berlin' };
+                    logger.info(`🎭 Browser-Fingerprint aus Session wiederhergestellt: UA=${fingerprint.userAgent.substring(0, 60)}...`);
+                }
+            } catch (_) {}
+        }
+        if (!fingerprint) {
+            fingerprint = generateFingerprint();
+            logger.info(`🎭 Neue Browser-Fingerprint: UA=${fingerprint.userAgent.substring(0, 60)}..., Viewport=${fingerprint.viewport.width}x${fingerprint.viewport.height}, Memory=${fingerprint.deviceMemory}GB, Cores=${fingerprint.hardwareConcurrency}`);
+            // Sofort in cookies.json sichern, damit der Fingerprint beim nächsten Neustart wiederverwendet wird
+            // (nicht erst nach Login – Session könnte dauerhaft gültig bleiben ohne je neu einzuloggen)
+            if (!forceClean && fs.existsSync(cookiefile)) {
+                try {
+                    const cookieData = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                    cookieData._fingerprint = {
+                        userAgent: fingerprint.userAgent,
+                        viewport: fingerprint.viewport,
+                        deviceMemory: fingerprint.deviceMemory,
+                        hardwareConcurrency: fingerprint.hardwareConcurrency
+                    };
+                    fs.writeFileSync(cookiefile, JSON.stringify(cookieData, null, 2));
+                } catch (_) {}
+            }
+        }
+        currentFingerprint = fingerprint;
 
         const browserOptions = {
             headless: true,
@@ -701,14 +744,8 @@ async function performLogin() {
             return true;
         }
 
-        loginAttempts++;
-        if (loginAttempts > MAX_LOGIN_ATTEMPTS) {
-            throw new Error(`Maximale Anzahl Login-Versuche (${MAX_LOGIN_ATTEMPTS}) erreicht`);
-        }
-
-        logger.info(`Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS}...`);
-
         const loginPromise = (async () => {
+            logger.info("Navigiere zur Login-Seite...");
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
@@ -718,6 +755,13 @@ async function performLogin() {
                 loginAttempts = 0;
                 return true;
             }
+
+            // Login-Formular erkannt → tatsächlicher Login erforderlich
+            loginAttempts++;
+            if (loginAttempts > MAX_LOGIN_ATTEMPTS) {
+                throw new Error(`Maximale Anzahl Login-Versuche (${MAX_LOGIN_ATTEMPTS}) erreicht`);
+            }
+            logger.info(`Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS}...`);
 
 			await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
 			await page.waitForSelector('input[name="password"]', { timeout: 15000 });
@@ -763,7 +807,7 @@ async function performLogin() {
             // Speichere Session-Daten (Cookies + localStorage)
             await context.storageState({ path: cookiefile });
 
-            // sessionStorage sichern (von storageState() nicht erfasst, aber für Vue-App Auth nötig)
+            // sessionStorage und Fingerprint sichern (von storageState() nicht erfasst)
             try {
                 const ssData = await page.evaluate(() => {
                     const result = {};
@@ -774,16 +818,24 @@ async function performLogin() {
                     return result;
                 });
                 const ssCount = Object.keys(ssData).length;
+                const saved = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
                 if (ssCount > 0) {
-                    const saved = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
                     saved._sessionStorage = { origin: new URL(page.url()).origin, data: ssData };
-                    fs.writeFileSync(cookiefile, JSON.stringify(saved, null, 2));
                     logger.info(`${ssCount} sessionStorage-Einträge gesichert`);
                 } else {
                     logger.debug("sessionStorage leer nach Login");
                 }
+                if (currentFingerprint) {
+                    saved._fingerprint = {
+                        userAgent: currentFingerprint.userAgent,
+                        viewport: currentFingerprint.viewport,
+                        deviceMemory: currentFingerprint.deviceMemory,
+                        hardwareConcurrency: currentFingerprint.hardwareConcurrency
+                    };
+                }
+                fs.writeFileSync(cookiefile, JSON.stringify(saved, null, 2));
             } catch (ssErr) {
-                logger.warn(`sessionStorage konnte nicht gesichert werden: ${ssErr.message}`);
+                logger.warn(`Session-Zusatzdaten konnten nicht gesichert werden: ${ssErr.message}`);
             }
 
             lastActivityTime = Date.now();
@@ -1347,6 +1399,8 @@ async function start() {
 
     const runMain = async () => {
         if (isShuttingDown) return;
+        updateHeartbeat(); // Watchdog: geplanter Lauf gestartet
+        nextScheduledRun = 0; // Sleep-Fenster beendet
 
         let datenVolumen = 0;
         let statusMessage = null;
@@ -1430,6 +1484,7 @@ async function start() {
             }
 
             // Timeout für nächsten Lauf setzen
+            nextScheduledRun = Date.now() + nextInterval * 1000; // Watchdog: geplanter Sleep-Start
             mainTimeout = setTimeout(runMain, nextInterval * 1000);
         }
     };
@@ -1463,10 +1518,11 @@ async function gracefulShutdown(signal) {
         if (!page?.isClosed() && context && fs.existsSync(cookiefile)) {
             try {
                 const existing = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
-                await context.storageState({ path: cookiefile }); // überschreibt _sessionStorage!
-                if (existing._sessionStorage) {
+                await context.storageState({ path: cookiefile }); // überschreibt _sessionStorage und _fingerprint!
+                if (existing._sessionStorage || existing._fingerprint) {
                     const updated = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
-                    updated._sessionStorage = existing._sessionStorage; // wiederherstellen
+                    if (existing._sessionStorage) updated._sessionStorage = existing._sessionStorage;
+                    if (existing._fingerprint) updated._fingerprint = existing._fingerprint;
                     fs.writeFileSync(cookiefile, JSON.stringify(updated, null, 2));
                 }
                 logger.info("Session-Daten vor Shutdown aktualisiert");
