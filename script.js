@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.3.2";
+const version = "1.3.5";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -593,6 +593,63 @@ async function initializeBrowser(forceClean = true) {
             browserOptions
         );
 
+        // Bei Session-Reuse: gespeicherte Cookies und localStorage in den Context laden
+        if (!forceClean && fs.existsSync(cookiefile)) {
+            try {
+                const storageState = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                let cookieCount = 0;
+                let lsCount = 0;
+
+                if (storageState.cookies?.length > 0) {
+                    await context.addCookies(storageState.cookies);
+                    cookieCount = storageState.cookies.length;
+                }
+
+                // localStorage wiederherstellen via InitScript (läuft vor jedem Seiten-Script)
+                if (storageState.origins?.length > 0) {
+                    const lsData = {};
+                    for (const origin of storageState.origins) {
+                        if (origin.localStorage?.length > 0) {
+                            lsData[origin.origin] = origin.localStorage;
+                            lsCount += origin.localStorage.length;
+                        }
+                    }
+                    if (lsCount > 0) {
+                        await context.addInitScript((data) => {
+                            const items = data[window.location.origin];
+                            if (items) {
+                                for (const { name, value } of items) {
+                                    try { localStorage.setItem(name, value); } catch (_) {}
+                                }
+                            }
+                        }, lsData);
+                    }
+                }
+
+                // sessionStorage wiederherstellen via InitScript (Vue-App Auth-Tokens)
+                // Playwright's storageState() erfasst kein sessionStorage → manuell gesichert
+                let ssCount = 0;
+                if (storageState._sessionStorage?.data) {
+                    const ssOrigin = storageState._sessionStorage.origin;
+                    const ssData = storageState._sessionStorage.data;
+                    ssCount = Object.keys(ssData).length;
+                    if (ssCount > 0) {
+                        await context.addInitScript(({ origin, data }) => {
+                            if (window.location.origin === origin) {
+                                for (const [key, value] of Object.entries(data)) {
+                                    try { sessionStorage.setItem(key, value); } catch (_) {}
+                                }
+                            }
+                        }, { origin: ssOrigin, data: ssData });
+                    }
+                }
+
+                logger.info(`Session geladen: ${cookieCount} Cookies, ${lsCount} localStorage, ${ssCount} sessionStorage Einträge`);
+            } catch (cookieError) {
+                logger.warn(`Session-Daten konnten nicht geladen werden: ${cookieError.message}`);
+            }
+        }
+
         logger.info("Browser erfolgreich gestartet");
         page = await context.newPage();
 
@@ -640,6 +697,7 @@ async function performLogin() {
     try {
         if (page.url().startsWith(uebersichtUrl)) {
             logger.info("Bereits auf der Übersichtsseite, kein Login nötig");
+            loginAttempts = 0;
             return true;
         }
 
@@ -657,7 +715,8 @@ async function performLogin() {
             // Gültige Session? → Lidl leitet direkt zur Übersicht weiter, kein Login-Formular nötig
             if (page.url().startsWith(uebersichtUrl)) {
                 logger.info("Session noch gültig, kein Login nötig");
-                return;
+                loginAttempts = 0;
+                return true;
             }
 
 			await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
@@ -701,8 +760,32 @@ async function performLogin() {
                 }
             }
 
-            // Speichere Session-Daten
+            // Speichere Session-Daten (Cookies + localStorage)
             await context.storageState({ path: cookiefile });
+
+            // sessionStorage sichern (von storageState() nicht erfasst, aber für Vue-App Auth nötig)
+            try {
+                const ssData = await page.evaluate(() => {
+                    const result = {};
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const key = sessionStorage.key(i);
+                        result[key] = sessionStorage.getItem(key);
+                    }
+                    return result;
+                });
+                const ssCount = Object.keys(ssData).length;
+                if (ssCount > 0) {
+                    const saved = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                    saved._sessionStorage = { origin: new URL(page.url()).origin, data: ssData };
+                    fs.writeFileSync(cookiefile, JSON.stringify(saved, null, 2));
+                    logger.info(`${ssCount} sessionStorage-Einträge gesichert`);
+                } else {
+                    logger.debug("sessionStorage leer nach Login");
+                }
+            } catch (ssErr) {
+                logger.warn(`sessionStorage konnte nicht gesichert werden: ${ssErr.message}`);
+            }
+
             lastActivityTime = Date.now();
             saveSessionMeta();
             loginAttempts = 0;
@@ -742,8 +825,9 @@ async function main() {
     try {
         return await circuitBreaker.execute(async () => {
             // Browser initialisieren falls nötig
+            // forceClean=false: vorhandene Session wiederverwenden (kein frischer Login)
             if (!context || !page || page.isClosed()) {
-                const initSuccess = await initializeBrowser();
+                const initSuccess = await initializeBrowser(false);
                 if (!initSuccess) {
                     throw new Error("Browser-Initialisierung fehlgeschlagen");
                 }
@@ -1374,6 +1458,22 @@ async function gracefulShutdown(signal) {
     try {
         // Stoppe alle Timer
         stopTimers();
+
+        // Session-Daten vor dem Schließen aktualisieren (erneuerte Cookies erhalten)
+        if (!page?.isClosed() && context && fs.existsSync(cookiefile)) {
+            try {
+                const existing = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                await context.storageState({ path: cookiefile }); // überschreibt _sessionStorage!
+                if (existing._sessionStorage) {
+                    const updated = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
+                    updated._sessionStorage = existing._sessionStorage; // wiederherstellen
+                    fs.writeFileSync(cookiefile, JSON.stringify(updated, null, 2));
+                }
+                logger.info("Session-Daten vor Shutdown aktualisiert");
+            } catch (saveErr) {
+                logger.debug(`Session-Update vor Shutdown übersprungen: ${saveErr.message}`);
+            }
+        }
 
         // Schließe Browser sicher
         await closeBrowserSafely();
