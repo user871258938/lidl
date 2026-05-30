@@ -1173,10 +1173,14 @@ function getSmartInterval(Datenvolumen) {
         return getRandomInteger(120, 180);    // max 180s × 6,25 MB/s ≈ 1,1 GB < 2 GB ✓
     } else if (Datenvolumen >= 1.0) {
         return getRandomInteger(60, 90);   // 1,0 GB / 7,5 MB/s = 136s → max 90s ✓
+    } else if (Datenvolumen >= 0.8) {
+        return getRandomInteger(55, 75);   // 0,8 GB / 7,5 MB/s = 109s → max 75s ✓
+    } else if (Datenvolumen >= 0.6) {
+        return getRandomInteger(45, 60);   // 0,6 GB / 7,5 MB/s =  82s → max 60s ✓
     } else if (Datenvolumen >= 0.5) {
-        return getRandomInteger(40, 60);   // 0,5 GB / 7,5 MB/s =  68s → max 60s ✓
+        return getRandomInteger(35, 50);   // 0,5 GB / 7,5 MB/s =  68s → max 50s ✓
     } else {
-        return getRandomInteger(25, 40);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
+        return getRandomInteger(25, 35);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
     }
 }
 
