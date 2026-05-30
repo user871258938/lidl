@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.2.8";
+const version = "1.3.2";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -89,7 +89,7 @@ function generateFingerprint() {
 // Verbesserte Konstanten für Stabilität
 const MAX_LOGIN_ATTEMPTS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const SESSION_KEEPALIVE_INTERVAL = 2 * 60 * 1000; // 2 Minuten (häufiger)
+const SESSION_KEEPALIVE_INTERVAL = 8 * 60 * 1000; // 8 Minuten (Keep-Alive nur bei langen Pausen nötig)
 const SESSION_TIMEOUT = 25 * 60 * 1000; // 25 Minuten (kürzer)
 const BROWSER_RESTART_INTERVAL = 2 * 60 * 60 * 1000; // 2 Stunden
 const MEMORY_CHECK_INTERVAL = 10 * 60 * 1000; // 10 Minuten
@@ -128,6 +128,9 @@ let lastMainRunTime = 0;
 // Rate-Limit exponentieller Backoff
 let rateLimitBackoffCount = 0;
 let rateLimitBackoffUntil = 0;
+
+// Letztes bekanntes Datenvolumen für Download-Erkennung
+let prevDatenVolumen = 0;  // unused, kept for future use
 
 // Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
 let lastTelegramStatusMessageId = null;
@@ -503,7 +506,9 @@ async function closeBrowserSafely() {
 }
 
 // Browser-Neustart Funktion
-async function restartBrowser() {
+// forceClean=false: Session-Daten behalten (geplanter Neustart)
+// forceClean=true:  Session-Daten löschen (Fehler-Neustart)
+async function restartBrowser(forceClean = true) {
     logger.info("Browser wird neu gestartet...");
 
     try {
@@ -512,7 +517,7 @@ async function restartBrowser() {
         // Kurze Pause vor Neustart
         await delay(5000);
 
-        const success = await initializeBrowser();
+        const success = await initializeBrowser(forceClean);
         if (success) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
@@ -532,7 +537,9 @@ async function restartBrowser() {
 }
 
 // Verbesserte Browser-Initialisierung
-async function initializeBrowser() {
+// forceClean=true:  Session-Daten löschen → frischer Login (bei Fehlern)
+// forceClean=false: Session-Daten behalten → bestehende Session wiederverwenden
+async function initializeBrowser(forceClean = true) {
     if (isShuttingDown) return false;
 
     try {
@@ -540,19 +547,23 @@ async function initializeBrowser() {
 
         const userDataDir = './lidl-extender-data';
 
-        // Lösche Browser-Daten immer beim Start für frischen Login
-        logger.info("Lösche Browser-Daten für frischen Login...");
-        try {
-            if (fs.existsSync(userDataDir)) {
-                fs.rmSync(userDataDir, { recursive: true, force: true });
-                logger.info("userDataDir gelöscht");
+        if (forceClean) {
+            // Lösche Browser-Daten für frischen Login (nur bei Fehler-Neustarts)
+            logger.info("Lösche Browser-Daten für frischen Login...");
+            try {
+                if (fs.existsSync(userDataDir)) {
+                    fs.rmSync(userDataDir, { recursive: true, force: true });
+                    logger.info("userDataDir gelöscht");
+                }
+                if (fs.existsSync(cookiefile)) {
+                    fs.unlinkSync(cookiefile);
+                    logger.info("cookies.json gelöscht");
+                }
+            } catch (cleanupError) {
+                logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
             }
-            if (fs.existsSync(cookiefile)) {
-                fs.unlinkSync(cookiefile);
-                logger.info("cookies.json gelöscht");
-            }
-        } catch (cleanupError) {
-            logger.warn(`Bereinigung fehlgeschlagen: ${cleanupError.message}`);
+        } else {
+            logger.info("Browser-Neustart mit bestehender Session (keine Daten gelöscht)");
         }
 
         // Generiere zufällige Fingerprint (außer locale/timezone)
@@ -643,6 +654,12 @@ async function performLogin() {
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
+            // Gültige Session? → Lidl leitet direkt zur Übersicht weiter, kein Login-Formular nötig
+            if (page.url().startsWith(uebersichtUrl)) {
+                logger.info("Session noch gültig, kein Login nötig");
+                return;
+            }
+
 			await page.waitForSelector('input[name="msisdn"]', { timeout: 15000 });
 			await page.waitForSelector('input[name="password"]', { timeout: 15000 });
 			
@@ -732,7 +749,7 @@ async function main() {
                 }
             }
 
-            // Login durchführen (Browser-Daten wurden bereits gelöscht bei initializeBrowser)
+            // Login durchführen (bei forceClean=true neu, bei forceClean=false Session wiederverwenden)
             logger.info("Führe Login durch...");
             const loginSuccess = await performLogin();
             if (!loginSuccess) {
@@ -1153,11 +1170,13 @@ function getSmartInterval(Datenvolumen) {
     } else if (Datenvolumen >= 3) {
         return getRandomInteger(180, 300);    // max 300s × 6,25 MB/s ≈ 1,9 GB < 3 GB ✓
     } else if (Datenvolumen >= 2) {
-        return getRandomInteger(90, 150);     // max 150s × 6,25 MB/s ≈ 0,9 GB < 2 GB ✓
+        return getRandomInteger(120, 180);    // max 180s × 6,25 MB/s ≈ 1,1 GB < 2 GB ✓
     } else if (Datenvolumen >= 1.0) {
-        return getRandomInteger(90, 120);     // max 120s × 6,25 MB/s ≈ 0,75 GB < 1,0 GB ✓
+        return getRandomInteger(60, 90);   // 1,0 GB / 7,5 MB/s = 136s → max 90s ✓
+    } else if (Datenvolumen >= 0.5) {
+        return getRandomInteger(40, 60);   // 0,5 GB / 7,5 MB/s =  68s → max 60s ✓
     } else {
-        return getRandomInteger(70, 90);      // Minimum bei sehr niedrigem Volumen
+        return getRandomInteger(25, 40);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
     }
 }
 
@@ -1191,7 +1210,7 @@ function startTimers() {
         if (!isShuttingDown) {
             logger.info("Planmäßiger Browser-Neustart nach 2 Stunden");
             updateHeartbeat(); // Signalisiere Watchdog dass Restart beabsichtigt ist
-            await restartBrowser();
+            await restartBrowser(false); // Session behalten → kein frischer Login
         }
     }, BROWSER_RESTART_INTERVAL);
 }
@@ -1299,6 +1318,10 @@ async function start() {
                     nextInterval = getInterval(datenVolumen);
                 }
             }
+
+            // Adaptives Interval und Download-Erkennung entfernt (v1.3.2)
+            // Kurze Intervalle funktionieren lt. Log problemlos; Rate-Limits
+            // wurden durch frische Sessions verursacht, nicht durch Polling-Frequenz.
 
             if (datenVolumen !== 0) {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
