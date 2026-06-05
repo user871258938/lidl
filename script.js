@@ -862,9 +862,15 @@ async function performLogin() {
 
     try {
         if (page.url().startsWith(uebersichtUrl)) {
-            logger.info("Bereits auf der Übersichtsseite, kein Login nötig");
-            loginAttempts = 0;
-            return true;
+            const hatLoginFormularFastPath = await page.evaluate(() =>
+                !!(document.querySelector('app-login-v2') || document.querySelector('.login-wrapper'))
+            );
+            if (!hatLoginFormularFastPath) {
+                logger.info("Bereits auf der Übersichtsseite, kein Login nötig");
+                loginAttempts = 0;
+                return true;
+            }
+            logger.info("Auf Übersichts-URL aber Login-Formular sichtbar (Vue SPA Redirect) - führe Login durch");
         }
 
         const loginPromise = (async () => {
