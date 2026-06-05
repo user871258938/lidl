@@ -1329,7 +1329,7 @@ function sendMessage(message, level) {
                 text: message,
                 parse_mode: "HTML"
             }).then(() => {
-                logger.info(`Telegram message sent: ${message}`);
+                logger.info(`Telegram message sent: ${message.replace(/\n/g, ' | ')}`);
             }).catch(err => {
                 logger.error(`Failed to send Telegram message: ${err.message}`);
             });
