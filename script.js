@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.1";
+const version = "1.4.2";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -131,6 +131,21 @@ let nextScheduledRun = 0;
 // Rate-Limit exponentieller Backoff
 let rateLimitBackoffCount = 0;
 let rateLimitBackoffUntil = 0;
+
+// Preemptives Throttling: warte bis ältester Request aus dem 10-min-Fenster fällt
+// Lidl-Schwelle: 9 Requests in 600s → Sicherheitspuffer bei 8
+// Zählt ALLE Request-Typen (reload, login, keepalive, refill etc.)
+const RATE_LIMIT_WINDOW_MS = 600 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 8;
+function getPreemptiveThrottleDelay() {
+    const now = Date.now();
+    const recentRequests = pageRequestLog.filter(e => e.time >= now - RATE_LIMIT_WINDOW_MS);
+    if (recentRequests.length < RATE_LIMIT_MAX_REQUESTS) return 0;
+    // 8+ Requests im Fenster: warte bis ältester rausfällt + 5s Puffer
+    const oldest = recentRequests[0].time;
+    const waitMs = Math.max(0, oldest + RATE_LIMIT_WINDOW_MS + 5000 - now);
+    return Math.ceil(waitMs / 1000);
+}
 
 // Debug: Zeitstempel jeder Seitenanfrage (für Rate-Limit-Diagnose)
 const pageRequestLog = [];
@@ -1511,6 +1526,7 @@ async function start() {
         let statusMessage = null;
         let forceNewMessage = false;
         let nextInterval = 300; // Default 5 Minuten
+        let lastResult = null;
 
         try {
             // Update-Check
@@ -1521,17 +1537,17 @@ async function start() {
             // Hauptfunktion ausführen
             lastMainRunTime = Date.now(); // Keep-Alive nach jedem Lauf drosseln (unabhängig vom Ergebnis)
             const mainStart = Date.now();
-            const result = await main();
+            lastResult = await main();
             logger.debug(`⏱️ main() Laufzeit: ${((Date.now() - mainStart) / 1000).toFixed(1)}s`);
-            datenVolumen = result.datenVolumen;
-            statusMessage = result.statusMessage;
-            forceNewMessage = result.forceNewMessage ?? false;
+            datenVolumen = lastResult.datenVolumen;
+            statusMessage = lastResult.statusMessage;
+            forceNewMessage = lastResult.forceNewMessage ?? false;
 
             // Rate-Limit Backoff als Interval verwenden
-            if (result.rateLimitBackoffSeconds) {
-                nextInterval = result.rateLimitBackoffSeconds;
-            } else if (result.nanRetryIn) {
-                nextInterval = result.nanRetryIn;
+            if (lastResult.rateLimitBackoffSeconds) {
+                nextInterval = lastResult.rateLimitBackoffSeconds;
+            } else if (lastResult.nanRetryIn) {
+                nextInterval = lastResult.nanRetryIn;
                 logger.info(`🔄 NaN-Reload abgeschlossen - Retry in ${nextInterval}s`);
             }
 
@@ -1571,9 +1587,14 @@ async function start() {
                 }
             }
 
-            // Adaptives Interval und Download-Erkennung entfernt (v1.3.2)
-            // Kurze Intervalle funktionieren lt. Log problemlos; Rate-Limits
-            // wurden durch frische Sessions verursacht, nicht durch Polling-Frequenz.
+            // Preemptives Throttling: wenn zu viele Reloads in letzten 10min, länger warten
+            if (!lastResult?.rateLimitBackoffSeconds && !lastResult?.nanRetryIn) {
+                const throttleDelay = getPreemptiveThrottleDelay();
+                if (throttleDelay > 0) {
+                    logger.info(`⏳ Preemptiv gedrosselt: ${throttleDelay}s warten (${RATE_LIMIT_MAX_REQUESTS}+ Requests in 10min)`);
+                    nextInterval = Math.max(nextInterval, throttleDelay);
+                }
+            }
 
             if (datenVolumen !== 0) {
                 logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
