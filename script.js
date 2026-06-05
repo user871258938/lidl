@@ -587,6 +587,7 @@ async function restartBrowser(forceClean = true) {
             lastBrowserRestart = Date.now();
             consecutiveErrors = 0;
             loginAttempts = 0;
+            resetPageErrors(); // Page-Errors nach Restart löschen (sonst Fehlalarm beim nächsten Login-Versuch)
             circuitBreaker.reset();
             updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
             logger.info("Browser erfolgreich neu gestartet");
@@ -959,6 +960,19 @@ async function performLogin() {
     } catch (error) {
         logger.error(`Login fehlgeschlagen: ${error.message}`);
         consecutiveErrors++;
+
+        // Vue-Crash während Login → sofortiger Browser-Restart + direkt neuer Login-Versuch
+        if (lastPageErrors.length > 0) {
+            logger.error(`Vue-Crash während Login erkannt (${lastPageErrors[lastPageErrors.length - 1].substring(0, 80)}) - starte Browser neu`);
+            sendMessage(`🚨 Vue-Crash während Login - Browser wird neu gestartet`, "warn");
+            try {
+                await restartBrowser(true);
+                // Restart erfolgreich → sofort frisch einloggen (lastPageErrors wurde in restartBrowser geleert)
+                logger.info("Browser nach Vue-Crash neu gestartet - versuche Login erneut...");
+                return await performLogin();
+            } catch (_) {}
+            return false;
+        }
 
         // Bei wiederholten Fehlern längere Pause
         if (loginAttempts >= 2) {
