@@ -25,6 +25,7 @@ const discordAllow = process.env.DISCORD_ALLOW === "true";
 const autoUpdate = process.env.AUTO_UPDATE === "true";
 const killExistingProcesses = process.env.KILL_EXISTING_PROCESSES === "true";
 const killScriptInstances = process.env.KILL_SCRIPT_INSTANCES === "true";
+const adaptiveIntervals = process.env.ADAPTIVE_INTERVALS === "true";
 const sleepmode = process.env.SLEEP_MODE;
 const sleepTime = parseInt(process.env.SLEEP_TIME, 10);
 const infoLevel = process.env.INFO_LEVEL || "info";
@@ -202,6 +203,10 @@ function saveIntervalAdjustments() {
 }
 
 function adjustIntervalForRateLimit(daten) {
+    if (!adaptiveIntervals) {
+        logger.debug('📐 Adaptive Intervals deaktiviert (ADAPTIVE_INTERVALS=false) - Bucket-Anpassung übersprungen');
+        return;
+    }
     if (daten <= 0) {
         logger.debug('📐 Rate-Limit: kein bekanntes Volumen, Bucket-Anpassung übersprungen');
         return;
@@ -1444,7 +1449,7 @@ function getSmartInterval(Datenvolumen) {
     // Intervals kalibriert für max. 50 Mbit/s (= 6,25 MB/s):
     // Max-Interval × 6,25 MB/s < verbleibendes Volumen → Daten laufen nie zwischen zwei Prüfungen aus
     const key = getBucketKey(Datenvolumen);
-    const adj = intervalAdjustments[key] || 0;
+    const adj = adaptiveIntervals ? (intervalAdjustments[key] || 0) : 0;
 
     let base;
     if (Datenvolumen >= 10) {
