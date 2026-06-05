@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.3.6";
+const version = "1.3.7";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -733,6 +733,39 @@ async function initializeBrowser(forceClean = true) {
     }
 }
 
+// Wartet auf vollständiges Rendern der Vue-Daten auf der Übersichtsseite
+async function navigateAndWaitForData() {
+    // Auf vollständiges Rendern der Vue-Komponenten warten
+    try {
+        await page.waitForLoadState("networkidle", { timeout: 20000 });
+    } catch (_) {
+        logger.debug("networkidle Timeout - fahre trotzdem fort");
+    }
+
+    // Warte bis die app-consumptions-v2 Komponente im DOM ist
+    try {
+        await page.waitForSelector('app-consumptions-v2, app-consumptions', { timeout: 15000 });
+    } catch (_) {
+        logger.debug("Consumption-Komponente nicht gefunden - warte auf Daten");
+    }
+
+    // Warte bis echte Zahlen im DOM erscheinen (robuster als fester Delay)
+    try {
+        await page.waitForFunction(() => {
+            const candidates = [
+                document.querySelector('label[for="DATA"].unit-display'),
+                document.querySelector('app-consumptions-v2 label[for="DATA"]'),
+                document.querySelector('app-consumptions label[for="DATA"]'),
+                document.querySelector('app-consumptions-v2 .unit-display'),
+                document.querySelector('app-consumptions .unit-display'),
+            ];
+            return candidates.some(el => el && /\d/.test(el.textContent));
+        }, { timeout: 15000 });
+    } catch (_) {
+        await delay(2000); // Fallback
+    }
+}
+
 // Verbesserte Login-Funktion mit Timeout und Retry-Logik
 async function performLogin() {
     if (isShuttingDown) return false;
@@ -892,26 +925,13 @@ async function main() {
                 throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
             }
 
-            // Seite immer neu laden für aktuelle Daten
-            await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-
-            // Auf vollständiges Rendern der Vue-Komponenten warten (Netzwerk + DOM)
-            try {
-                await page.waitForLoadState("networkidle", { timeout: 20000 });
-            } catch (_) {
-                logger.debug("networkidle Timeout - fahre trotzdem fort");
+            // Zur Übersichtsseite navigieren – aber nur wenn nicht bereits dort
+            // (performLogin() landet bereits auf uebersichtUrl bei gültiger Session)
+            if (!page.url().startsWith(uebersichtUrl)) {
+                await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             }
 
-            // Warte bis die app-consumptions-v2 Komponente im DOM ist
-            try {
-                await page.waitForSelector('app-consumptions-v2, app-consumptions', { timeout: 15000 });
-                logger.debug("Consumption-Komponente im DOM gefunden");
-            } catch (error) {
-                logger.warn(`Consumption-Komponente nicht gefunden: ${error.message}`);
-            }
-
-            // Extra-Wartezeit damit Vue die Labels rendern kann
-            await delay(3000);
+            await navigateAndWaitForData();
 
 			// Datenvolumen auslesen (Tarif + Refill)
 			// Versuche mehrere Selector-Varianten für alte und neue Seitenstruktur
@@ -1014,23 +1034,24 @@ async function main() {
 				return { datenVolumen: 0, statusMessage: null, rateLimitBackoffSeconds: backoffMinutes * 60 };
 			}
 
-			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
+			// NaN-Fehlerbehandlung: Seite direkt neu laden (kein neuer Zyklus → spart Seitenladevorgang)
 			if (isNaN(datenVerfuegbar)) {
 				nanErrorCount++;
-				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount}/${MAX_NAN_ERRORS}`);
+				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount}/${MAX_NAN_ERRORS} - lade Seite neu`);
 				sendMessage(`⚠️ Datenvolumen nicht lesbar (${nanErrorCount}/${MAX_NAN_ERRORS}) - Seite wird neu geladen`, "warn");
 
 				if (nanErrorCount >= MAX_NAN_ERRORS) {
 					logger.error("Zu viele NaN-Fehler - Browser wird neu gestartet");
 					sendMessage("🚨 Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
-
-					await restartBrowser();
 					nanErrorCount = 0;
-
+					await restartBrowser();
 					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
 				}
 
-				return { datenVolumen: 0, statusMessage: null }; // Rückgabewert 0 triggt längere Pause in der Hauptschleife
+				// In-place Reload: keine neue Navigation nötig, spart einen Request
+				await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+				await navigateAndWaitForData();
+				return { datenVolumen: 0, statusMessage: null };
 			}
 
 			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
