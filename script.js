@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.0";
+const version = "1.4.1";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -985,7 +985,8 @@ async function main() {
                 trackPageRequest('goto-uebersicht');
                 await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             } else {
-                trackPageRequest('already-uebersicht');
+                trackPageRequest('reload-uebersicht');
+                await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
             }
 
             await navigateAndWaitForData();
