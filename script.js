@@ -25,7 +25,6 @@ const discordAllow = process.env.DISCORD_ALLOW === "true";
 const autoUpdate = process.env.AUTO_UPDATE === "true";
 const killExistingProcesses = process.env.KILL_EXISTING_PROCESSES === "true";
 const killScriptInstances = process.env.KILL_SCRIPT_INSTANCES === "true";
-const adaptiveIntervals = process.env.ADAPTIVE_INTERVALS === "true";
 const sleepmode = process.env.SLEEP_MODE;
 const sleepTime = parseInt(process.env.SLEEP_TIME, 10);
 const infoLevel = process.env.INFO_LEVEL || "info";
@@ -36,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.3.9";
+const version = "1.4.0";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -91,10 +90,10 @@ function generateFingerprint() {
 const MAX_LOGIN_ATTEMPTS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const SESSION_KEEPALIVE_INTERVAL = 8 * 60 * 1000; // 8 Minuten (Keep-Alive nur bei langen Pausen nötig)
-const SESSION_TIMEOUT = 25 * 60 * 1000; // 25 Minuten (kürzer)
 const BROWSER_RESTART_INTERVAL = 2 * 60 * 60 * 1000; // 2 Stunden
 const MEMORY_CHECK_INTERVAL = 10 * 60 * 1000; // 10 Minuten
 const MAX_MEMORY_MB = 500; // Maximaler Speicherverbrauch in MB
+
 
 // Globale Variablen mit besserer Verwaltung
 let context = null;
@@ -167,60 +166,7 @@ function resetPageErrors() {
     lastPageErrors = [];
 }
 
-// Adaptive Interval-Anpassung: bei Rate-Limit wird das betroffene Bucket um 3s erhöht
-const INTERVAL_ADJUST_STEP = 3;   // Sekunden pro Rate-Limit-Ereignis
-const INTERVAL_ADJUST_MAX = 120;  // Maximale Erhöhung pro Bucket (2 Minuten extra)
-const intervalAdjustments = {};   // { bucketKey: additionalSeconds }
-const intervalAdjustFile = "interval_adjustments.json";
 
-function getBucketKey(daten) {
-    if (daten >= 10) return '>=10';
-    if (daten >= 5)  return '>=5';
-    if (daten >= 3)  return '>=3';
-    if (daten >= 2)  return '>=2';
-    if (daten >= 1.0) return '>=1.0';
-    if (daten >= 0.8) return '>=0.8';
-    if (daten >= 0.6) return '>=0.6';
-    if (daten >= 0.5) return '>=0.5';
-    return '<0.5';
-}
-
-function loadIntervalAdjustments() {
-    try {
-        if (fs.existsSync(intervalAdjustFile)) {
-            const data = JSON.parse(fs.readFileSync(intervalAdjustFile, 'utf-8'));
-            Object.assign(intervalAdjustments, data);
-            const entries = Object.entries(intervalAdjustments).map(([k, v]) => `${k}:+${v}s`).join(', ');
-            logger.info(`📐 Interval-Anpassungen geladen: ${entries || 'keine'}`);
-        }
-    } catch (_) {}
-}
-
-function saveIntervalAdjustments() {
-    try {
-        fs.writeFileSync(intervalAdjustFile, JSON.stringify(intervalAdjustments, null, 2));
-    } catch (_) {}
-}
-
-function adjustIntervalForRateLimit(daten) {
-    if (!adaptiveIntervals) {
-        logger.debug('📐 Adaptive Intervals deaktiviert (ADAPTIVE_INTERVALS=false) - Bucket-Anpassung übersprungen');
-        return;
-    }
-    if (daten <= 0) {
-        logger.debug('📐 Rate-Limit: kein bekanntes Volumen, Bucket-Anpassung übersprungen');
-        return;
-    }
-    const key = getBucketKey(daten);
-    const current = intervalAdjustments[key] || 0;
-    const newVal = Math.min(current + INTERVAL_ADJUST_STEP, INTERVAL_ADJUST_MAX);
-    intervalAdjustments[key] = newVal;
-    saveIntervalAdjustments();
-    logger.info(`📐 Interval-Anpassung Bucket ${key}: +${INTERVAL_ADJUST_STEP}s → gesamt +${newVal}s (letztes Volumen: ${daten} GB)`);
-}
-
-// Letztes bekanntes Datenvolumen für Download-Erkennung (unused, kept for future use)
-let prevDatenVolumen = 0;
 
 // Aktueller Browser-Fingerprint (für konsistente Session-Wiederherstellung)
 let currentFingerprint = null;
@@ -1138,7 +1084,6 @@ async function main() {
 			if (usage._rateLimited) {
 				rateLimitBackoffCount++;
 				logRateLimitStats();
-				adjustIntervalForRateLimit(lastKnownDatenVolumen);
 				const backoffMinutes = Math.min(3 * Math.pow(2, rateLimitBackoffCount - 1), 30);
 				rateLimitBackoffUntil = Date.now() + backoffMinutes * 60 * 1000;
 				lastMainRunTime = Date.now();
@@ -1454,9 +1399,6 @@ function getInterval(daten) {
 function getSmartInterval(Datenvolumen) {
     // Intervals kalibriert für max. 50 Mbit/s (= 6,25 MB/s):
     // Max-Interval × 6,25 MB/s < verbleibendes Volumen → Daten laufen nie zwischen zwei Prüfungen aus
-    const key = getBucketKey(Datenvolumen);
-    const adj = adaptiveIntervals ? (intervalAdjustments[key] || 0) : 0;
-
     let base;
     if (Datenvolumen >= 10) {
         base = getRandomInteger(600, 900);    // max 900s × 6,25 MB/s ≈ 5,6 GB < 10 GB ✓
@@ -1478,13 +1420,8 @@ function getSmartInterval(Datenvolumen) {
         base = getRandomInteger(25, 35);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
     }
 
-    const total = base + adj;
-    if (adj > 0) {
-        logger.info(`📐 Interval Bucket ${key}: ${base}s + ${adj}s Anpassung = ${total}s (${Datenvolumen} GB)`);
-    } else {
-        logger.debug(`📐 Interval Bucket ${key}: ${base}s (${Datenvolumen} GB, keine Anpassung)`);
-    }
-    return total;
+    logger.debug(`⏱️ Smart Interval: ${base}s (${Datenvolumen} GB)`);
+    return base;
 }
 
 // Timer-Management
@@ -1557,9 +1494,6 @@ async function start() {
     } else {
         logger.info("Überspringen: KILL_SCRIPT_INSTANCES=false (alte Instanzen werden NICHT gekillt)");
     }
-
-    // Geladene Interval-Anpassungen wiederherstellen (persistiert über Neustarts)
-    loadIntervalAdjustments();
 
     // Starte alle Timer
     startTimers();
