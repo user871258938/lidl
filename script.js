@@ -35,7 +35,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.3.7";
+const version = "1.3.9";
 const updateUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/package.json";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
@@ -132,8 +132,90 @@ let nextScheduledRun = 0;
 let rateLimitBackoffCount = 0;
 let rateLimitBackoffUntil = 0;
 
-// Letztes bekanntes Datenvolumen für Download-Erkennung
-let prevDatenVolumen = 0;  // unused, kept for future use
+// Debug: Zeitstempel jeder Seitenanfrage (für Rate-Limit-Diagnose)
+const pageRequestLog = [];
+const PAGE_REQUEST_LOG_MAX = 200; // Maximal 200 Einträge behalten
+function trackPageRequest(label) {
+    pageRequestLog.push({ time: Date.now(), label });
+    if (pageRequestLog.length > PAGE_REQUEST_LOG_MAX) pageRequestLog.shift();
+}
+function logRateLimitStats() {
+    const now = Date.now();
+    const windows = [1, 2, 5, 10];
+    const parts = windows.map(min => {
+        const since = now - min * 60 * 1000;
+        const count = pageRequestLog.filter(e => e.time >= since).length;
+        return `${min}min=${count}`;
+    });
+    logger.info(`📈 Rate-Limit Debug: Seitenaufrufe (${parts.join(', ')})`);
+    // Letzte 10 Anfragen mit Label
+    const last10 = pageRequestLog.slice(-10).map(e => {
+        const sAgo = Math.round((now - e.time) / 1000);
+        return `${e.label}(-${sAgo}s)`;
+    }).join(', ');
+    logger.info(`📈 Rate-Limit Debug letzte Aufrufe: ${last10}`);
+}
+
+// Letztes erfolgreich gelesenes Datenvolumen (für Rate-Limit-Bucket-Zuordnung)
+let lastKnownDatenVolumen = 0;
+
+// Letzter Page-Error (Vue-Abstürze etc.) – wird vor jeder Navigation zurückgesetzt
+let lastPageErrors = [];
+
+function resetPageErrors() {
+    lastPageErrors = [];
+}
+
+// Adaptive Interval-Anpassung: bei Rate-Limit wird das betroffene Bucket um 3s erhöht
+const INTERVAL_ADJUST_STEP = 3;   // Sekunden pro Rate-Limit-Ereignis
+const INTERVAL_ADJUST_MAX = 120;  // Maximale Erhöhung pro Bucket (2 Minuten extra)
+const intervalAdjustments = {};   // { bucketKey: additionalSeconds }
+const intervalAdjustFile = "interval_adjustments.json";
+
+function getBucketKey(daten) {
+    if (daten >= 10) return '>=10';
+    if (daten >= 5)  return '>=5';
+    if (daten >= 3)  return '>=3';
+    if (daten >= 2)  return '>=2';
+    if (daten >= 1.0) return '>=1.0';
+    if (daten >= 0.8) return '>=0.8';
+    if (daten >= 0.6) return '>=0.6';
+    if (daten >= 0.5) return '>=0.5';
+    return '<0.5';
+}
+
+function loadIntervalAdjustments() {
+    try {
+        if (fs.existsSync(intervalAdjustFile)) {
+            const data = JSON.parse(fs.readFileSync(intervalAdjustFile, 'utf-8'));
+            Object.assign(intervalAdjustments, data);
+            const entries = Object.entries(intervalAdjustments).map(([k, v]) => `${k}:+${v}s`).join(', ');
+            logger.info(`📐 Interval-Anpassungen geladen: ${entries || 'keine'}`);
+        }
+    } catch (_) {}
+}
+
+function saveIntervalAdjustments() {
+    try {
+        fs.writeFileSync(intervalAdjustFile, JSON.stringify(intervalAdjustments, null, 2));
+    } catch (_) {}
+}
+
+function adjustIntervalForRateLimit(daten) {
+    if (daten <= 0) {
+        logger.debug('📐 Rate-Limit: kein bekanntes Volumen, Bucket-Anpassung übersprungen');
+        return;
+    }
+    const key = getBucketKey(daten);
+    const current = intervalAdjustments[key] || 0;
+    const newVal = Math.min(current + INTERVAL_ADJUST_STEP, INTERVAL_ADJUST_MAX);
+    intervalAdjustments[key] = newVal;
+    saveIntervalAdjustments();
+    logger.info(`📐 Interval-Anpassung Bucket ${key}: +${INTERVAL_ADJUST_STEP}s → gesamt +${newVal}s (letztes Volumen: ${daten} GB)`);
+}
+
+// Letztes bekanntes Datenvolumen für Download-Erkennung (unused, kept for future use)
+let prevDatenVolumen = 0;
 
 // Aktueller Browser-Fingerprint (für konsistente Session-Wiederherstellung)
 let currentFingerprint = null;
@@ -476,6 +558,7 @@ async function keepSessionAlive() {
 
     try {
         const keepAlivePromise = (async () => {
+            trackPageRequest('keepalive-reload');
             await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
             lastActivityTime = Date.now();
             saveSessionMeta();
@@ -718,6 +801,7 @@ async function initializeBrowser(forceClean = true) {
 
         page.on('pageerror', error => {
             logger.error(`Page error: ${error.message}`);
+            lastPageErrors.push(error.message);
         });
 
         page.on('crash', () => {
@@ -735,6 +819,7 @@ async function initializeBrowser(forceClean = true) {
 
 // Wartet auf vollständiges Rendern der Vue-Daten auf der Übersichtsseite
 async function navigateAndWaitForData() {
+    resetPageErrors(); // Page-Error-Tracking für diese Navigation zurücksetzen
     // Auf vollständiges Rendern der Vue-Komponenten warten
     try {
         await page.waitForLoadState("networkidle", { timeout: 20000 });
@@ -779,12 +864,17 @@ async function performLogin() {
 
         const loginPromise = (async () => {
             logger.info("Navigiere zur Login-Seite...");
+            trackPageRequest('login');
             await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             await delay(2000);
 
-            // Gültige Session? → Lidl leitet direkt zur Übersicht weiter, kein Login-Formular nötig
-            if (page.url().startsWith(uebersichtUrl)) {
-                logger.info("Session noch gültig, kein Login nötig");
+            // Gültige Session? → DOM-Check: Login-Formular sichtbar?
+            // URL-Check reicht nicht: Login-Form kann auf jeder URL erscheinen
+            const hatLoginFormularNachGoto = await page.evaluate(() =>
+                !!(document.querySelector('app-login-v2') || document.querySelector('.login-wrapper'))
+            );
+            if (!hatLoginFormularNachGoto) {
+                logger.info(`Session noch gültig (kein Login-Formular) - URL: ${page.url()}`);
                 loginAttempts = 0;
                 return true;
             }
@@ -820,20 +910,27 @@ async function performLogin() {
             try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch (_) {}
             await delay(1000);
 
-            const currentUrl = page.url();
-            // Akzeptiere auch /mein-lidl-connect/ als valide post-login URL (falls Lidl Redirect geändert)
-            if (!currentUrl.includes("mein-lidl-connect")) {
-                throw new Error(`Login fehlgeschlagen, unerwartete URL: ${currentUrl}`);
+            // Login-Erfolg per DOM prüfen: Login-Formular noch sichtbar = fehlgeschlagen
+            const hatLoginFormularNachSubmit = await page.evaluate(() =>
+                !!(document.querySelector('app-login-v2') || document.querySelector('.login-wrapper'))
+            );
+            if (hatLoginFormularNachSubmit) {
+                throw new Error(`Login fehlgeschlagen - Login-Formular noch sichtbar (URL: ${page.url()})`);
             }
+            logger.info(`Login-Formular verschwunden - eingeloggt (URL: ${page.url()})`);
 
-            // Falls auf Übersichtsseite umgeleitet, gut - sonst manuell navigieren
-            if (!currentUrl.startsWith(uebersichtUrl)) {
-                logger.info(`Post-login URL: ${currentUrl} - navigiere zu Übersicht`);
+            // Falls noch nicht auf Übersichtsseite → manuell navigieren
+            if (!page.url().startsWith(uebersichtUrl)) {
+                logger.info(`Post-login URL: ${page.url()} - navigiere zu Übersicht`);
+                trackPageRequest('post-login-goto-uebersicht');
                 await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
                 await delay(2000);
-                const urlNachNav = page.url();
-                if (!urlNachNav.includes("mein-lidl-connect")) {
-                    throw new Error(`Navigation zur Übersicht fehlgeschlagen: ${urlNachNav}`);
+                // Auch nach goto Übersicht: Login-Form darf nicht erscheinen
+                const hatLoginFormularNachNav = await page.evaluate(() =>
+                    !!(document.querySelector('app-login-v2') || document.querySelector('.login-wrapper'))
+                );
+                if (hatLoginFormularNachNav) {
+                    throw new Error(`Navigation zur Übersicht fehlgeschlagen - Login-Formular erschienen (URL: ${page.url()})`);
                 }
             }
 
@@ -928,7 +1025,10 @@ async function main() {
             // Zur Übersichtsseite navigieren – aber nur wenn nicht bereits dort
             // (performLogin() landet bereits auf uebersichtUrl bei gültiger Session)
             if (!page.url().startsWith(uebersichtUrl)) {
+                trackPageRequest('goto-uebersicht');
                 await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+            } else {
+                trackPageRequest('already-uebersicht');
             }
 
             await navigateAndWaitForData();
@@ -1026,6 +1126,8 @@ async function main() {
 			// Rate-Limit-Erkennung: Lidl zeigt Platzhaltertext wenn zu viele Anfragen
 			if (usage._rateLimited) {
 				rateLimitBackoffCount++;
+				logRateLimitStats();
+				adjustIntervalForRateLimit(lastKnownDatenVolumen);
 				const backoffMinutes = Math.min(3 * Math.pow(2, rateLimitBackoffCount - 1), 30);
 				rateLimitBackoffUntil = Date.now() + backoffMinutes * 60 * 1000;
 				lastMainRunTime = Date.now();
@@ -1037,21 +1139,40 @@ async function main() {
 			// NaN-Fehlerbehandlung: Seite direkt neu laden (kein neuer Zyklus → spart Seitenladevorgang)
 			if (isNaN(datenVerfuegbar)) {
 				nanErrorCount++;
-				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount}/${MAX_NAN_ERRORS} - lade Seite neu`);
+
+				// Diagnose: Page-Errors und DOM-Zustand loggen
+				const domLeer = Array.isArray(usage._debugSelectors) && usage._debugSelectors.length === 0;
+				const pageErrInfo = lastPageErrors.length > 0
+					? ` | Page-Error: ${lastPageErrors[lastPageErrors.length - 1].substring(0, 80)}`
+					: '';
+				const domInfo = domLeer
+					? ' | DOM leer (Vue-Absturz?)'
+					: (usage._debugSelectors ? ` | ${usage._debugSelectors.length} DOM-Elemente gefunden (falsche Selektoren?)` : '');
+
+				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount}/${MAX_NAN_ERRORS}${pageErrInfo}${domInfo} - lade Seite neu`);
 				sendMessage(`⚠️ Datenvolumen nicht lesbar (${nanErrorCount}/${MAX_NAN_ERRORS}) - Seite wird neu geladen`, "warn");
 
 				if (nanErrorCount >= MAX_NAN_ERRORS) {
 					logger.error("Zu viele NaN-Fehler - Browser wird neu gestartet");
 					sendMessage("🚨 Zu viele NaN-Fehler - Versuche Neuanmeldung", "warn");
 					nanErrorCount = 0;
-					await restartBrowser();
+					await restartBrowser(true); // forceClean: Session löschen → frischer Login
 					throw new Error("NaN-Fehlerbehandlung: Browser neugestartet");
 				}
 
-				// In-place Reload: keine neue Navigation nötig, spart einen Request
-				await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+				// Vue-Absturz erkannt → goto statt reload (erzwingt neue Vue-Initialisierung)
+				if (domLeer && lastPageErrors.length > 0) {
+					logger.info('Vue-Crash erkannt - erzwinge frische Navigation zu Übersicht statt reload');
+					trackPageRequest('vue-crash-goto');
+					await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+				} else {
+					// In-place Reload: keine neue Navigation nötig, spart einen Request
+					trackPageRequest('nan-reload');
+					await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+				}
 				await navigateAndWaitForData();
-				return { datenVolumen: 0, statusMessage: null };
+				// Schnell-Retry: Seite ist jetzt geladen, kein 5-Min-Wait nötig
+				return { datenVolumen: 0, statusMessage: null, nanRetryIn: 15 };
 			}
 
 			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
@@ -1081,6 +1202,7 @@ async function main() {
                     await delay(7000);
                     
                     // Seite neu laden und Refill-Volumen neu prüfen
+                    trackPageRequest('refill-reload');
                     await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
                     try { await page.waitForLoadState("networkidle", { timeout: 15000 }); } catch (_) {}
                     await delay(3000);
@@ -1133,6 +1255,7 @@ async function main() {
 
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
             datenVolumen = datenVerfuegbar + (!isNaN(refillVerfuegbar) ? refillVerfuegbar : 0);
+            lastKnownDatenVolumen = datenVolumen; // Für Rate-Limit-Bucket-Zuordnung
             lastActivityTime = Date.now();
             lastMainRunTime = Date.now(); // Keep-Alive-Throttling
             rateLimitBackoffCount = 0; // Backoff zurücksetzen nach erfolgreichem Lesen
@@ -1320,25 +1443,37 @@ function getInterval(daten) {
 function getSmartInterval(Datenvolumen) {
     // Intervals kalibriert für max. 50 Mbit/s (= 6,25 MB/s):
     // Max-Interval × 6,25 MB/s < verbleibendes Volumen → Daten laufen nie zwischen zwei Prüfungen aus
+    const key = getBucketKey(Datenvolumen);
+    const adj = intervalAdjustments[key] || 0;
+
+    let base;
     if (Datenvolumen >= 10) {
-        return getRandomInteger(600, 900);    // max 900s × 6,25 MB/s ≈ 5,6 GB < 10 GB ✓
+        base = getRandomInteger(600, 900);    // max 900s × 6,25 MB/s ≈ 5,6 GB < 10 GB ✓
     } else if (Datenvolumen >= 5) {
-        return getRandomInteger(300, 480);    // max 480s × 6,25 MB/s ≈ 3,0 GB < 5 GB ✓
+        base = getRandomInteger(300, 480);    // max 480s × 6,25 MB/s ≈ 3,0 GB < 5 GB ✓
     } else if (Datenvolumen >= 3) {
-        return getRandomInteger(180, 300);    // max 300s × 6,25 MB/s ≈ 1,9 GB < 3 GB ✓
+        base = getRandomInteger(180, 300);    // max 300s × 6,25 MB/s ≈ 1,9 GB < 3 GB ✓
     } else if (Datenvolumen >= 2) {
-        return getRandomInteger(120, 180);    // max 180s × 6,25 MB/s ≈ 1,1 GB < 2 GB ✓
+        base = getRandomInteger(120, 180);    // max 180s × 6,25 MB/s ≈ 1,1 GB < 2 GB ✓
     } else if (Datenvolumen >= 1.0) {
-        return getRandomInteger(60, 90);   // 1,0 GB / 7,5 MB/s = 136s → max 90s ✓
+        base = getRandomInteger(60, 90);   // 1,0 GB / 7,5 MB/s = 136s → max 90s ✓
     } else if (Datenvolumen >= 0.8) {
-        return getRandomInteger(55, 75);   // 0,8 GB / 7,5 MB/s = 109s → max 75s ✓
+        base = getRandomInteger(55, 75);   // 0,8 GB / 7,5 MB/s = 109s → max 75s ✓
     } else if (Datenvolumen >= 0.6) {
-        return getRandomInteger(45, 60);   // 0,6 GB / 7,5 MB/s =  82s → max 60s ✓
+        base = getRandomInteger(45, 60);   // 0,6 GB / 7,5 MB/s =  82s → max 60s ✓
     } else if (Datenvolumen >= 0.5) {
-        return getRandomInteger(35, 50);   // 0,5 GB / 7,5 MB/s =  68s → max 50s ✓
+        base = getRandomInteger(35, 50);   // 0,5 GB / 7,5 MB/s =  68s → max 50s ✓
     } else {
-        return getRandomInteger(25, 35);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
+        base = getRandomInteger(25, 35);   // kritisch: kurz genug für < 0,5 GB bei 60 Mbit/s
     }
+
+    const total = base + adj;
+    if (adj > 0) {
+        logger.info(`📐 Interval Bucket ${key}: ${base}s + ${adj}s Anpassung = ${total}s (${Datenvolumen} GB)`);
+    } else {
+        logger.debug(`📐 Interval Bucket ${key}: ${base}s (${Datenvolumen} GB, keine Anpassung)`);
+    }
+    return total;
 }
 
 // Timer-Management
@@ -1412,6 +1547,9 @@ async function start() {
         logger.info("Überspringen: KILL_SCRIPT_INSTANCES=false (alte Instanzen werden NICHT gekillt)");
     }
 
+    // Geladene Interval-Anpassungen wiederherstellen (persistiert über Neustarts)
+    loadIntervalAdjustments();
+
     // Starte alle Timer
     startTimers();
     startWatchdog(); // Watchdog für Deadlock/CPU-Überwachung
@@ -1436,7 +1574,9 @@ async function start() {
 
             // Hauptfunktion ausführen
             lastMainRunTime = Date.now(); // Keep-Alive nach jedem Lauf drosseln (unabhängig vom Ergebnis)
+            const mainStart = Date.now();
             const result = await main();
+            logger.debug(`⏱️ main() Laufzeit: ${((Date.now() - mainStart) / 1000).toFixed(1)}s`);
             datenVolumen = result.datenVolumen;
             statusMessage = result.statusMessage;
             forceNewMessage = result.forceNewMessage ?? false;
@@ -1444,6 +1584,9 @@ async function start() {
             // Rate-Limit Backoff als Interval verwenden
             if (result.rateLimitBackoffSeconds) {
                 nextInterval = result.rateLimitBackoffSeconds;
+            } else if (result.nanRetryIn) {
+                nextInterval = result.nanRetryIn;
+                logger.info(`🔄 NaN-Reload abgeschlossen - Retry in ${nextInterval}s`);
             }
 
             // Reset consecutive errors bei Erfolg
