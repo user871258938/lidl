@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.14";
+const version = "1.4.15";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -189,6 +189,8 @@ let restartPromise = null;
 let updateCheckInProgress = false;
 let lastUpdateCheckAt = 0;
 let lastDeadlineCollisionAlertAt = 0;
+let lastLoginWaitNoticeAt = 0;
+const LOGIN_WAIT_NOTICE_COOLDOWN_MS = 10 * 60 * 1000;
 
 // Watchdog-Variablen für Deadlock-Erkennung
 let watchdogTimer = null;
@@ -296,6 +298,7 @@ async function reservePageRequest(label, requestedSlots = 1) {
 
             const waitSeconds = Math.ceil(budget.delayMs / 1000);
             const now = Date.now();
+            const isLoginRequest = label === "login" || label === "login-submit";
             // Lange Budget-Wartezeiten können mehrere Minuten dauern. Ein
             // Eintrag am Anfang, alle fünf Minuten und kurz vor dem Ende reicht
             // für die Diagnose und verhindert Log-Spam im Minutentakt.
@@ -304,16 +307,34 @@ async function reservePageRequest(label, requestedSlots = 1) {
                 now - budgetWaitLogAt >= 5 * 60 * 1000 ||
                 waitSeconds <= 15;
             const safeDeadline = getSafeCheckDeadline(lastSchedulingVolume, lastSchedulingBaselineAt);
-            if (safeDeadline > 0 && budget.waitUntil > safeDeadline && shouldLogBudgetWait) {
+            const deadlineCollision = safeDeadline > 0 && budget.waitUntil > safeDeadline;
+            let userNoticeSent = false;
+            if (deadlineCollision && shouldLogBudgetWait) {
                 const lateBySeconds = Math.ceil((budget.waitUntil - safeDeadline) / 1000);
                 logger.error(`Request-Budget kollidiert mit Daten-Deadline (${budget.blockedWindows.join(", ")}; ${lateBySeconds}s zu spät). Ohne Download-Drosselung ist die Kontinuität nicht garantiert.`);
                 if (Date.now() - lastDeadlineCollisionAlertAt >= 10 * 60 * 1000) {
                     lastDeadlineCollisionAlertAt = Date.now();
-                    sendMessage(
-                        `⚠️ Request-Budget blockiert einen rechtzeitigen Datencheck um ${lateBySeconds}s. Download bitte drosseln/pausieren.`,
-                        "warn"
-                    );
+                    if (isLoginRequest) {
+                        userNoticeSent = true;
+                        lastLoginWaitNoticeAt = Date.now();
+                        sendMessage(`⏳ Login wartet wegen des Request-Budgets ca. ${waitSeconds}s.`, "info");
+                    } else {
+                        sendMessage(
+                            `⚠️ Request-Budget blockiert einen rechtzeitigen Datencheck um ${lateBySeconds}s. Download bitte drosseln/pausieren.`,
+                            "warn"
+                        );
+                    }
                 }
+            }
+
+            if (
+                isLoginRequest &&
+                waitSeconds >= 30 &&
+                !userNoticeSent &&
+                Date.now() - lastLoginWaitNoticeAt >= LOGIN_WAIT_NOTICE_COOLDOWN_MS
+            ) {
+                lastLoginWaitNoticeAt = Date.now();
+                sendMessage(`\u23f3 Login wird wegen des Request-Budgets f\u00fcr ca. ${waitSeconds}s pausiert.`, "info");
             }
 
             if (shouldLogBudgetWait) {
@@ -1645,7 +1666,11 @@ async function performLogin(recoveryAttempt = 0) {
         return await loginPromise;
 
     } catch (error) {
-        logger.error(`Login fehlgeschlagen: ${error.message}`);
+        if (loginAttempts < MAX_LOGIN_ATTEMPTS) {
+            logger.warn(`Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS} nicht erfolgreich: ${error.message}`);
+        } else {
+            logger.error(`Login endgültig fehlgeschlagen: ${error.message}`);
+        }
         consecutiveErrors++;
 
         // Vue-Crash während Login → sofortiger Browser-Restart + direkt neuer Login-Versuch
@@ -2538,8 +2563,20 @@ async function start() {
             }
 
         } catch (err) {
-            logger.error(`Error in main execution: ${err.message}`);
-            sendMessage(`🚨 Fehler in Hauptausführung: ${err.message}`, "error");
+            const retryableLoginFailure =
+                loginAttempts > 0 &&
+                loginAttempts < MAX_LOGIN_ATTEMPTS &&
+                /Login .*fehlgeschlagen|Login .*nicht erfolgreich/i.test(err.message || "");
+            if (retryableLoginFailure) {
+                logger.warn(`Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS} fehlgeschlagen - nächster Versuch wird geplant`);
+                sendMessage(
+                    `⏳ Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS} nicht erfolgreich. Ein neuer Versuch wird geplant.`,
+                    "info"
+                );
+            } else {
+                logger.error(`Error in main execution: ${err.message}`);
+                sendMessage(`🚨 Fehler in Hauptausführung: ${err.message}`, "error");
+            }
             consecutiveErrors++;
 
             // Bei zu vielen Fehlern Browser neu aufbauen; der Folgetermin bleibt
