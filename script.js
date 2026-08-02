@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.10";
+const version = "1.4.12";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -2132,7 +2132,7 @@ async function checkForUpdates() {
 
 function isPermanentTelegramEditFailure(error) {
     const description = error?.response?.data?.description || "";
-    return /message to edit not found|message can't be edited|message is too old|chat not found/i.test(description);
+    return /message to edit not found|message can't be edited|message is too old|message identifier is not specified|message not found|chat not found/i.test(description);
 }
 
 // Telegram-Status: eine einzige Nachricht wiederverwenden und editieren.
@@ -2145,12 +2145,17 @@ async function sendOrEditStatusMessage(message) {
 
     if (lastTelegramStatusMessageId) {
         try {
-            await axios.post(`https://api.telegram.org/bot${telegramToken}/editMessageText`, {
+            const editResponse = await axios.post(`https://api.telegram.org/bot${telegramToken}/editMessageText`, {
                 chat_id: telegramChatId,
                 message_id: lastTelegramStatusMessageId,
                 text: message,
                 parse_mode: "HTML"
             });
+            if (editResponse.data?.ok === false) {
+                const telegramError = new Error(editResponse.data.description || "Telegram rejected the status update");
+                telegramError.response = editResponse;
+                throw telegramError;
+            }
             lastTelegramStatusMessageText = message;
             saveSessionMeta();
             logger.info(`Telegram Statusnachricht aktualisiert`);
@@ -2180,6 +2185,9 @@ async function sendOrEditStatusMessage(message) {
             text: message,
             parse_mode: "HTML"
         });
+        if (res.data?.ok === false) {
+            throw new Error(res.data.description || "Telegram rejected the status message");
+        }
         lastTelegramStatusMessageId = res.data?.result?.message_id ?? null;
         lastTelegramStatusMessageText = message;
         saveSessionMeta();
@@ -2451,6 +2459,14 @@ async function start() {
     // Erst nach einer optionalen Altprozess-Bereinigung laden, damit deren letzter
     // persistierter Request-Stand nicht direkt wieder überschrieben wird.
     loadSessionMeta();
+
+    // Jeder Neustart beginnt bewusst mit einem neuen Telegram-Statuszyklus.
+    // Die alte Statusnachricht bleibt als Verlauf erhalten; der erste erfolgreiche
+    // Datencheck legt eine neue Nachricht an, die danach wieder bearbeitet wird.
+    lastTelegramStatusMessageId = null;
+    lastTelegramStatusMessageText = "";
+    saveSessionMeta();
+    sendMessage("🚀 Lidl-Extender gestartet", "info");
 
     // Starte alle Timer
     startTimers();
