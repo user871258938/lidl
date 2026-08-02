@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.12";
+const version = "1.4.13";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -2039,7 +2039,7 @@ async function main() {
             }
             if (lastRefillAt > 0) {
                 const refillTime = new Date(lastRefillAt).toLocaleString("de-DE");
-                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}`;
+                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}\n🖱️ Refill-Button gedrückt`;
             }
 
             const nextCheckAt = schedulingBaselineAt + getInterval(schedulingVolume) * 1000;
