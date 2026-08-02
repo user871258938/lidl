@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.16";
+const version = "1.4.18";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -2160,53 +2160,23 @@ async function checkForUpdates() {
     }
 }
 
-function isPermanentTelegramEditFailure(error) {
-    const description = error?.response?.data?.description || "";
-    return /message to edit not found|message can't be edited|message is too old|message identifier is not specified|message not found|chat not found/i.test(description);
-}
-
-// Telegram-Status: eine einzige Nachricht wiederverwenden und editieren.
-// Nur wenn Telegram sie tatsächlich nicht mehr bearbeiten kann, wird sie
-// einmalig ersetzt. Dadurch bleiben Status-Updates und Refill-Hinweise lesbar,
-// ohne bei jedem Check eine neue Nachricht anzulegen.
+// Telegram-Status: alte Nachricht lГ¶schen und den aktuellen Status neu senden.
+// Dadurch erhГ¤lt jede Statusnachricht einen neuen Zeitstempel und steht nach
+// den zuvor gesendeten Warnungen/Fehlern im Chat.
 async function sendOrEditStatusMessage(message) {
     if (!telegramAllow || !telegramToken || !telegramChatId || isShuttingDown) return;
     if (infoLevel !== "info") return;
 
     if (lastTelegramStatusMessageId) {
         try {
-            const editResponse = await axios.post(`https://api.telegram.org/bot${telegramToken}/editMessageText`, {
+            await axios.post(`https://api.telegram.org/bot${telegramToken}/deleteMessage`, {
                 chat_id: telegramChatId,
-                message_id: lastTelegramStatusMessageId,
-                text: message,
-                parse_mode: "HTML"
+                message_id: lastTelegramStatusMessageId
             });
-            if (editResponse.data?.ok === false) {
-                const telegramError = new Error(editResponse.data.description || "Telegram rejected the status update");
-                telegramError.response = editResponse;
-                throw telegramError;
-            }
-            lastTelegramStatusMessageText = message;
-            saveSessionMeta();
-            logger.info(`Telegram Statusnachricht aktualisiert`);
-            return;
-        } catch (error) {
-            if (!isPermanentTelegramEditFailure(error)) {
-                logger.debug(`Telegram-Status konnte vorübergehend nicht aktualisiert werden: ${error.message}`);
-                return;
-            }
-
-            // Veraltete/gelöschte Nachricht einmalig aufräumen, danach neu senden.
-            try {
-                await axios.post(`https://api.telegram.org/bot${telegramToken}/deleteMessage`, {
-                    chat_id: telegramChatId,
-                    message_id: lastTelegramStatusMessageId
-                });
-            } catch (_) { /* Nachricht bereits gelöscht - ignorieren */ }
-            lastTelegramStatusMessageId = null;
-            lastTelegramStatusMessageText = "";
-            saveSessionMeta();
-        }
+        } catch (_) { /* Nachricht bereits gelГ¶scht oder nicht erreichbar */ }
+        lastTelegramStatusMessageId = null;
+        lastTelegramStatusMessageText = "";
+        saveSessionMeta();
     }
 
     try {
