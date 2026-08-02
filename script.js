@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.18";
+const version = "1.4.20";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -151,10 +151,10 @@ function generateFingerprint() {
 const MAX_LOGIN_ATTEMPTS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const SESSION_KEEPALIVE_INTERVAL = 8 * 60 * 1000; // 8 Minuten (Keep-Alive nur bei langen Pausen nötig)
-const configuredBrowserRestartHours = Number.parseFloat(process.env.BROWSER_RESTART_INTERVAL_HOURS ?? "0");
+const configuredBrowserRestartHours = Number.parseFloat(process.env.BROWSER_RESTART_INTERVAL_HOURS ?? "2");
 const BROWSER_RESTART_INTERVAL = Number.isFinite(configuredBrowserRestartHours) && configuredBrowserRestartHours > 0
     ? configuredBrowserRestartHours * 60 * 60 * 1000
-    : 0; // Standardmäßig aus: der feste 2h-Restart erzeugte im Log regelmäßig Login-/Vue-Crash-Kaskaden.
+    : 0; // 0 deaktiviert den planmäßigen Neustart; Standard sind zwei Stunden.
 const MEMORY_CHECK_INTERVAL = 10 * 60 * 1000; // 10 Minuten
 const MAX_MEMORY_MB = 500; // Maximaler Speicherverbrauch in MB
 const MEMORY_RESTART_THRESHOLD_MB = Math.max(
@@ -165,6 +165,7 @@ const MEMORY_RESTART_COOLDOWN_MS = getPositiveIntegerFromEnv(
     "MEMORY_RESTART_COOLDOWN_MINUTES",
     60
 ) * 60 * 1000;
+const SESSION_PERSIST_INTERVAL_MS = 15 * 60 * 1000;
 
 
 // Globale Variablen mit besserer Verwaltung
@@ -180,6 +181,7 @@ let isShuttingDown = false;
 let lastBrowserRestart = Date.now();
 let lastMemoryRestartAt = 0;
 let lastMemoryWarningAt = 0;
+let lastBrowserSessionPersistAt = 0;
 let mainRunInProgress = false;
 let keepAliveInProgress = false;
 let pendingPlannedRestart = false;
@@ -298,7 +300,10 @@ async function reservePageRequest(label, requestedSlots = 1) {
 
             const waitSeconds = Math.ceil(budget.delayMs / 1000);
             const now = Date.now();
-            const isLoginRequest = label === "login" || label === "login-submit";
+            const isSessionCheckRequest = label === "login";
+            const isLoginSubmitRequest = label === "login-submit";
+            const isLoginRequest = isSessionCheckRequest || isLoginSubmitRequest;
+            const authenticationWaitSubject = isSessionCheckRequest ? "Session-Prüfung" : "Login";
             // Lange Budget-Wartezeiten können mehrere Minuten dauern. Ein
             // Eintrag am Anfang, alle fünf Minuten und kurz vor dem Ende reicht
             // für die Diagnose und verhindert Log-Spam im Minutentakt.
@@ -317,7 +322,7 @@ async function reservePageRequest(label, requestedSlots = 1) {
                     if (isLoginRequest) {
                         userNoticeSent = true;
                         lastLoginWaitNoticeAt = Date.now();
-                        sendMessage(`⏳ Login wartet wegen des Request-Budgets ca. ${waitSeconds}s.`, "info");
+                        sendMessage(`⏳ ${authenticationWaitSubject} wartet wegen des Request-Budgets ca. ${waitSeconds}s.`, "info");
                     } else {
                         sendMessage(
                             `⚠️ Request-Budget blockiert einen rechtzeitigen Datencheck um ${lateBySeconds}s. Download bitte drosseln/pausieren.`,
@@ -334,7 +339,7 @@ async function reservePageRequest(label, requestedSlots = 1) {
                 Date.now() - lastLoginWaitNoticeAt >= LOGIN_WAIT_NOTICE_COOLDOWN_MS
             ) {
                 lastLoginWaitNoticeAt = Date.now();
-                sendMessage(`\u23f3 Login wird wegen des Request-Budgets f\u00fcr ca. ${waitSeconds}s pausiert.`, "info");
+                sendMessage(`⏳ ${authenticationWaitSubject} wird wegen des Request-Budgets für ca. ${waitSeconds}s pausiert.`, "info");
             }
 
             if (shouldLogBudgetWait) {
@@ -391,6 +396,12 @@ const NAVIGATION_NETWORK_EVENT_MAX = 60;
 
 function resetPageErrors() {
     lastPageErrors = [];
+}
+
+function hasSessionRefreshError() {
+    return lastPageErrors.some(error =>
+        /not refresh token|currentCustomer.*undefined|currentCustomer.*not defined/i.test(error)
+    );
 }
 
 function resetNavigationDiagnostics() {
@@ -457,9 +468,11 @@ function getNavigationNetworkSummary() {
 // Aktueller Browser-Fingerprint (für konsistente Session-Wiederherstellung)
 let currentFingerprint = null;
 
-// Telegram: ID der letzten Status-Nachricht (für Edit statt neue Nachricht)
+// Telegram: ID der jeweils ersetzbaren Status-Nachricht
 let lastTelegramStatusMessageId = null;
-let lastTelegramStatusMessageText = "";
+let preserveCurrentTelegramStatusOnNextSend = false;
+let telegramOperationQueue = Promise.resolve();
+let authRecoveryNoticeActive = false;
 
 // Circuit Breaker Pattern
 class CircuitBreaker {
@@ -1016,6 +1029,74 @@ async function keepSessionAlive() {
     }
 }
 
+// Playwrights storageState() enthält kein sessionStorage. Deshalb wird der
+// aktuelle Inhalt des Lidl-Tabs vor jedem Session-erhaltenden Schließen separat
+// in dieselbe Datei geschrieben. So wird kein beim Betrieb rotierter Auth-Token
+// durch einen älteren Snapshot ersetzt.
+async function persistCurrentBrowserSession(reason = "") {
+    if (!context) return false;
+
+    try {
+        let existing = {};
+        if (fs.existsSync(cookiefile)) {
+            try {
+                existing = JSON.parse(fs.readFileSync(cookiefile, "utf-8"));
+            } catch (_) {}
+        }
+
+        const updated = await context.storageState();
+        let liveSessionStorageCaptured = false;
+        let sessionStorageCount = 0;
+
+        if (page && !page.isClosed() && isTrustedLidlUrl(page.url())) {
+            const ssData = await page.evaluate(() => {
+                const result = {};
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    result[key] = sessionStorage.getItem(key);
+                }
+                return result;
+            });
+            sessionStorageCount = Object.keys(ssData).length;
+            updated._sessionStorage = {
+                origin: new URL(page.url()).origin,
+                data: ssData
+            };
+            liveSessionStorageCaptured = true;
+        } else if (existing._sessionStorage) {
+            // Nur als Fallback, wenn gerade kein auslesbarer Lidl-Tab existiert.
+            // Der normale Shutdown-/Restart-Pfad verwendet immer den Live-Stand.
+            updated._sessionStorage = existing._sessionStorage;
+            sessionStorageCount = Object.keys(existing._sessionStorage.data || {}).length;
+        }
+
+        if (currentFingerprint) {
+            updated._fingerprint = {
+                userAgent: currentFingerprint.userAgent,
+                viewport: currentFingerprint.viewport,
+                deviceMemory: currentFingerprint.deviceMemory,
+                hardwareConcurrency: currentFingerprint.hardwareConcurrency
+            };
+        } else if (existing._fingerprint) {
+            updated._fingerprint = existing._fingerprint;
+        }
+
+        fs.writeFileSync(cookiefile, JSON.stringify(updated, null, 2));
+        const sessionLogMessage =
+            `Session-Daten${reason ? ` ${reason}` : ""} aktualisiert ` +
+            `(${sessionStorageCount} sessionStorage-Einträge${liveSessionStorageCaptured ? ", live" : ", Fallback"})`;
+        if (reason === "nach Datencheck") {
+            logger.debug(sessionLogMessage);
+        } else {
+            logger.info(sessionLogMessage);
+        }
+        return liveSessionStorageCaptured;
+    } catch (error) {
+        logger.warn(`Session-Daten${reason ? ` ${reason}` : ""} konnten nicht aktualisiert werden: ${error.message}`);
+        return false;
+    }
+}
+
 // Sicheres Browser-Schließen
 async function closeBrowserSafely() {
     try {
@@ -1050,6 +1131,13 @@ async function restartBrowser(forceClean = true) {
         logger.info("Browser wird neu gestartet...");
 
         try {
+            const memoryBeforeRestart = getMemoryUsage();
+            if (!forceClean) {
+                const liveSessionSaved = await persistCurrentBrowserSession("vor Browser-Neustart");
+                if (!liveSessionSaved) {
+                    logger.warn("Browser-Neustart verwendet mangels auslesbarem Lidl-Tab den letzten Session-Snapshot");
+                }
+            }
             await closeBrowserSafely();
 
             // Kurze Pause vor Neustart
@@ -1069,6 +1157,13 @@ async function restartBrowser(forceClean = true) {
                 pendingRestartForceClean = false;
                 pendingRestartMustRun = false;
                 updateHeartbeat(); // Signalisiere Watchdog dass Browser aktiv ist
+                if (global.gc) global.gc();
+                await delay(1000);
+                const memoryAfterRestart = getMemoryUsage();
+                logger.info(
+                    `Speicher vor/nach Browser-Neustart: RSS ${memoryBeforeRestart.rss}→${memoryAfterRestart.rss}MB, ` +
+                    `Heap ${memoryBeforeRestart.heapUsed}→${memoryAfterRestart.heapUsed}MB`
+                );
                 logger.info("Browser erfolgreich neu gestartet");
                 sendMessage("🔄 Browser wurde neu gestartet", "info");
                 return true;
@@ -1515,6 +1610,7 @@ async function performLogin(recoveryAttempt = 0) {
             if (!loginFormAlreadyVisible) {
                 logger.info("Bereits auf der Übersichtsseite, kein Login nötig");
                 loginAttempts = 0;
+                authRecoveryNoticeActive = false;
                 return true;
             }
             logger.info("Auf Übersichts-URL aber Login-Formular sichtbar - verwende vorhandenes Formular direkt");
@@ -1552,10 +1648,19 @@ async function performLogin(recoveryAttempt = 0) {
                 logger.info(`Session noch gültig (kein Login-Formular) - URL: ${page.url()}`);
                 overviewFreshFromLogin = page.url().startsWith(uebersichtUrl);
                 loginAttempts = 0;
+                authRecoveryNoticeActive = false;
                 return true;
             }
 
             // Login-Formular erkannt → tatsächlicher Login erforderlich
+            if (hasSessionRefreshError() && !authRecoveryNoticeActive) {
+                authRecoveryNoticeActive = true;
+                logger.warn("Gespeicherte Sitzung konnte nicht erneuert werden - automatische Neuanmeldung läuft");
+                sendMessage(
+                    "⚠️ Sitzung konnte nicht erneuert werden – automatische Neuanmeldung läuft.",
+                    "warn"
+                );
+            }
             loginAttempts++;
             if (loginAttempts > MAX_LOGIN_ATTEMPTS) {
                 throw new Error(`Maximale Anzahl Login-Versuche (${MAX_LOGIN_ATTEMPTS}) erreicht`);
@@ -1616,44 +1721,13 @@ async function performLogin(recoveryAttempt = 0) {
                 }
             }
 
-            // Speichere Session-Daten (Cookies + localStorage)
-            await context.storageState({ path: cookiefile });
-
-            // sessionStorage und Fingerprint sichern (von storageState() nicht erfasst)
-            try {
-                const ssData = await page.evaluate(() => {
-                    const result = {};
-                    for (let i = 0; i < sessionStorage.length; i++) {
-                        const key = sessionStorage.key(i);
-                        result[key] = sessionStorage.getItem(key);
-                    }
-                    return result;
-                });
-                const ssCount = Object.keys(ssData).length;
-                const saved = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
-                if (ssCount > 0) {
-                    saved._sessionStorage = { origin: new URL(page.url()).origin, data: ssData };
-                    logger.info(`${ssCount} sessionStorage-Einträge gesichert`);
-                } else {
-                    logger.debug("sessionStorage leer nach Login");
-                }
-                if (currentFingerprint) {
-                    saved._fingerprint = {
-                        userAgent: currentFingerprint.userAgent,
-                        viewport: currentFingerprint.viewport,
-                        deviceMemory: currentFingerprint.deviceMemory,
-                        hardwareConcurrency: currentFingerprint.hardwareConcurrency
-                    };
-                }
-                fs.writeFileSync(cookiefile, JSON.stringify(saved, null, 2));
-            } catch (ssErr) {
-                logger.warn(`Session-Zusatzdaten konnten nicht gesichert werden: ${ssErr.message}`);
-            }
+            await persistCurrentBrowserSession("nach Login");
 
             lastActivityTime = Date.now();
             saveSessionMeta();
             loginAttempts = 0;
             consecutiveErrors = 0;
+            authRecoveryNoticeActive = false;
 
             logger.info("Login erfolgreich, Session-Daten gespeichert");
             return true;
@@ -1672,18 +1746,31 @@ async function performLogin(recoveryAttempt = 0) {
         }
         consecutiveErrors++;
 
-        // Vue-Crash während Login → sofortiger Browser-Restart + direkt neuer Login-Versuch
+        // Fehlerzustand der Login-App: mit frischer Sitzung neu aufbauen und direkt
+        // erneut anmelden. Das ist kein Browser-Crash und wird auch nicht so gemeldet.
         if (lastPageErrors.length > 0) {
             if (recoveryAttempt >= MAX_LOGIN_ATTEMPTS - 1) {
-                logger.error(`Vue-Crash während Login nach ${recoveryAttempt + 1} Recovery-Versuchen - breche Login-Zyklus ab`);
+                logger.error(`Login-App nach ${recoveryAttempt + 1} Recovery-Versuchen weiterhin fehlerhaft - breche Login-Zyklus ab`);
                 return false;
             }
-            logger.error(`Vue-Crash während Login erkannt (${lastPageErrors[lastPageErrors.length - 1].substring(0, 80)}) - starte Browser neu`);
-            sendMessage(`🚨 Vue-Crash während Login - Browser wird neu gestartet`, "warn");
+            if (hasSessionRefreshError() && !authRecoveryNoticeActive) {
+                authRecoveryNoticeActive = true;
+                sendMessage(
+                    "⚠️ Sitzung konnte nicht erneuert werden – automatische Neuanmeldung läuft.",
+                    "warn"
+                );
+            }
+            logger.error(`Login-App reagiert fehlerhaft (${lastPageErrors[lastPageErrors.length - 1].substring(0, 80)}) - starte mit frischer Sitzung`);
+            sendMessage(
+                authRecoveryNoticeActive
+                    ? "🔄 Neuanmeldung blieb hängen – Browser wird mit frischer Sitzung neu gestartet."
+                    : "🔄 Login-Seite reagiert nicht – Browser wird mit frischer Sitzung neu gestartet.",
+                "warn"
+            );
             try {
                 await restartBrowser(true);
-                // Restart erfolgreich → sofort frisch einloggen (lastPageErrors wurde in restartBrowser geleert)
-                logger.info("Browser nach Vue-Crash neu gestartet - versuche Login erneut...");
+                // Restart erfolgreich → sofort frisch einloggen (Page-Errors wurden geleert)
+                logger.info("Browser mit frischer Sitzung neu gestartet - versuche Login erneut...");
                 return await performLogin(recoveryAttempt + 1);
             } catch (_) {}
             return false;
@@ -2057,6 +2144,13 @@ async function main() {
             } else {
                 rateLimitRecoverySuccessCount = 0;
             }
+            // Zusätzlich höchstens alle 15 Minuten sichern. Das erzeugt keinen
+            // Seitenaufruf, erfasst aber Token-Rotationen auch vor einem harten
+            // Prozessabbruch, bei dem kein Shutdown-Handler mehr laufen könnte.
+            if (Date.now() - lastBrowserSessionPersistAt >= SESSION_PERSIST_INTERVAL_MS) {
+                const liveSessionSaved = await persistCurrentBrowserSession("nach Datencheck");
+                if (liveSessionSaved) lastBrowserSessionPersistAt = Date.now();
+            }
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
@@ -2134,6 +2228,7 @@ async function checkForUpdates() {
 
                 saveSessionMeta();
                 stopTimers();
+                await persistCurrentBrowserSession("vor Script-Update");
                 await closeBrowserSafely();
                 const replacement = spawn(process.execPath, [localScriptPath], {
                     cwd: scriptDirectory,
@@ -2160,41 +2255,48 @@ async function checkForUpdates() {
     }
 }
 
-// Telegram-Status: alte Nachricht lГ¶schen und den aktuellen Status neu senden.
-// Dadurch erhГ¤lt jede Statusnachricht einen neuen Zeitstempel und steht nach
-// den zuvor gesendeten Warnungen/Fehlern im Chat.
-async function sendOrEditStatusMessage(message) {
+// Telegram-Status: zuerst den aktuellen Status neu senden und erst danach den
+// vorherigen Status löschen. Nach einer Warnung/einem Fehler bleibt der alte
+// Status einmalig als Momentaufnahme vor dem Vorfall im Chat stehen.
+function enqueueTelegramOperation(operation) {
+    const queuedOperation = telegramOperationQueue.then(operation, operation);
+    telegramOperationQueue = queuedOperation.catch(() => {});
+    return queuedOperation;
+}
+
+async function sendFreshStatusMessage(message) {
     if (!telegramAllow || !telegramToken || !telegramChatId || isShuttingDown) return;
     if (infoLevel !== "info") return;
 
-    if (lastTelegramStatusMessageId) {
+    const previousStatusMessageId = lastTelegramStatusMessageId;
+    const preservePreviousStatus = preserveCurrentTelegramStatusOnNextSend;
+    return enqueueTelegramOperation(async () => {
         try {
-            await axios.post(`https://api.telegram.org/bot${telegramToken}/deleteMessage`, {
+            const res = await axios.post(telegramApiUrl, {
                 chat_id: telegramChatId,
-                message_id: lastTelegramStatusMessageId
+                text: message,
+                parse_mode: "HTML"
             });
-        } catch (_) { /* Nachricht bereits gelГ¶scht oder nicht erreichbar */ }
-        lastTelegramStatusMessageId = null;
-        lastTelegramStatusMessageText = "";
-        saveSessionMeta();
-    }
+            if (res.data?.ok === false) {
+                throw new Error(res.data.description || "Telegram rejected the status message");
+            }
+            lastTelegramStatusMessageId = res.data?.result?.message_id ?? null;
+            preserveCurrentTelegramStatusOnNextSend = false;
+            saveSessionMeta();
 
-    try {
-        const res = await axios.post(telegramApiUrl, {
-            chat_id: telegramChatId,
-            text: message,
-            parse_mode: "HTML"
-        });
-        if (res.data?.ok === false) {
-            throw new Error(res.data.description || "Telegram rejected the status message");
+            if (previousStatusMessageId && !preservePreviousStatus) {
+                try {
+                    await axios.post(`https://api.telegram.org/bot${telegramToken}/deleteMessage`, {
+                        chat_id: telegramChatId,
+                        message_id: previousStatusMessageId
+                    });
+                } catch (_) { /* Nachricht bereits gelöscht oder Telegram vorübergehend nicht erreichbar */ }
+            }
+            logger.info(`Telegram Statusnachricht gesendet`);
+        } catch (err) {
+            logger.error(`Failed to send Telegram message: ${err.message}`);
         }
-        lastTelegramStatusMessageId = res.data?.result?.message_id ?? null;
-        lastTelegramStatusMessageText = message;
-        saveSessionMeta();
-        logger.info(`Telegram Statusnachricht gesendet`);
-    } catch (err) {
-        logger.error(`Failed to send Telegram message: ${err.message}`);
-    }
+    });
 }
 
 // Verbesserte Nachrichtenfunktion
@@ -2207,14 +2309,23 @@ function sendMessage(message, level) {
             (level === "info" && infoLevel === "info");
 
         if (shouldSend) {
-            axios.post(telegramApiUrl, {
-                chat_id: telegramChatId,
-                text: message,
-                parse_mode: "HTML"
-            }).then(() => {
-                logger.info(`Telegram message sent: ${message.replace(/\n/g, ' | ')}`);
-            }).catch(err => {
-                logger.error(`Failed to send Telegram message: ${err.message}`);
+            if (level === "warn" || level === "error") {
+                preserveCurrentTelegramStatusOnNextSend = true;
+            }
+            enqueueTelegramOperation(async () => {
+                try {
+                    const res = await axios.post(telegramApiUrl, {
+                        chat_id: telegramChatId,
+                        text: message,
+                        parse_mode: "HTML"
+                    });
+                    if (res.data?.ok === false) {
+                        throw new Error(res.data.description || "Telegram rejected the message");
+                    }
+                    logger.info(`Telegram message sent: ${message.replace(/\n/g, ' | ')}`);
+                } catch (err) {
+                    logger.error(`Failed to send Telegram message: ${err.message}`);
+                }
             });
         }
     }
@@ -2372,6 +2483,10 @@ function startTimers() {
         browserRestartTimer = null;
     }
     if (BROWSER_RESTART_INTERVAL > 0) {
+        logger.info(
+            `Planmäßiger Browser-Neustart alle ` +
+            `${(BROWSER_RESTART_INTERVAL / 60 / 60 / 1000).toFixed(2)} Stunden aktiviert`
+        );
         browserRestartTimer = setInterval(() => {
             if (!isShuttingDown) {
                 updateHeartbeat(); // Signalisiere Watchdog dass Restart beabsichtigt ist
@@ -2462,11 +2577,11 @@ async function start() {
 
     // Jeder Neustart beginnt bewusst mit einem neuen Telegram-Statuszyklus.
     // Die alte Statusnachricht bleibt als Verlauf erhalten; der erste erfolgreiche
-    // Datencheck legt eine neue Nachricht an, die danach wieder bearbeitet wird.
+    // Datencheck legt eine neue Nachricht an, die danach wieder ersetzt wird.
     lastTelegramStatusMessageId = null;
-    lastTelegramStatusMessageText = "";
+    preserveCurrentTelegramStatusOnNextSend = false;
     saveSessionMeta();
-    sendMessage("🚀 Lidl-Extender gestartet", "info");
+    sendMessage(`🚀 Lidl-Extender v${version} gestartet`, "info");
 
     // Starte alle Timer
     startTimers();
@@ -2634,7 +2749,7 @@ async function start() {
                 // Sende oder aktualisiere Telegram-Nachricht mit korrektem Interval
                 if (statusMessage) {
                     statusMessage += `\n⏰ Nächste Prüfung in ${nextInterval} Sekunden.`;
-                    await sendOrEditStatusMessage(statusMessage);
+                    await sendFreshStatusMessage(statusMessage);
                 }
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
@@ -2675,7 +2790,7 @@ async function gracefulShutdown(signal) {
     if (isShuttingDown) return;
 
     logger.info(`🛑 Received ${signal}. Shutting down gracefully...`);
-    sendMessage("🛑 Lidl-Extender wird beendet...", "info");
+    sendMessage(`🛑 Lidl-Extender v${version} wird beendet...`, "info");
 
     isShuttingDown = true;
 
@@ -2683,22 +2798,9 @@ async function gracefulShutdown(signal) {
         // Stoppe alle Timer
         stopTimers();
 
-        // Session-Daten vor dem Schließen aktualisieren (erneuerte Cookies erhalten)
-        if (!page?.isClosed() && context && fs.existsSync(cookiefile)) {
-            try {
-                const existing = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
-                await context.storageState({ path: cookiefile }); // überschreibt _sessionStorage und _fingerprint!
-                if (existing._sessionStorage || existing._fingerprint) {
-                    const updated = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
-                    if (existing._sessionStorage) updated._sessionStorage = existing._sessionStorage;
-                    if (existing._fingerprint) updated._fingerprint = existing._fingerprint;
-                    fs.writeFileSync(cookiefile, JSON.stringify(updated, null, 2));
-                }
-                logger.info("Session-Daten vor Shutdown aktualisiert");
-            } catch (saveErr) {
-                logger.debug(`Session-Update vor Shutdown übersprungen: ${saveErr.message}`);
-            }
-        }
+        // Aktuelle Cookies, localStorage und insbesondere den live rotierten
+        // sessionStorage-Token sichern, bevor der Tab geschlossen wird.
+        await persistCurrentBrowserSession("vor Shutdown");
 
         // Schließe Browser sicher
         await closeBrowserSafely();
