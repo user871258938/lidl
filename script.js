@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.13";
+const version = "1.4.14";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -359,6 +359,7 @@ let lastSchedulingVolume = 0;
 let lastSchedulingBaselineAt = 0;
 let refillFollowupPending = false;
 let lastRefillAt = 0;
+let refillClickedSinceStart = false;
 
 // Letzter Page-Error (Vue-Abstürze etc.) – wird vor jeder Navigation zurückgesetzt
 let lastPageErrors = [];
@@ -1983,6 +1984,7 @@ async function main() {
                     const refillClickedAt = Date.now();
                     refillFollowupPending = true;
                     lastRefillAt = refillClickedAt;
+                    refillClickedSinceStart = true;
 
                     // Lidl aktualisiert die Anzeige nach dem Klick nicht zuverlässig live.
                     // Deshalb kein Reload: Nur die Terminplanung nimmt bis zum nächsten
@@ -2039,7 +2041,10 @@ async function main() {
             }
             if (lastRefillAt > 0) {
                 const refillTime = new Date(lastRefillAt).toLocaleString("de-DE");
-                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}\n🖱️ Refill-Button gedrückt`;
+                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}`;
+                if (refillClickedSinceStart) {
+                    finalStatusMessage += `\n🖱️ Refill-Button gedrückt`;
+                }
             }
 
             const nextCheckAt = schedulingBaselineAt + getInterval(schedulingVolume) * 1000;
