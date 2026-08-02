@@ -96,7 +96,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.8";
+const version = "1.4.10";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -359,8 +359,6 @@ let lastSchedulingVolume = 0;
 let lastSchedulingBaselineAt = 0;
 let refillFollowupPending = false;
 let lastRefillAt = 0;
-let lastRefillBeforeGb = NaN;
-let refillActivationCount = 0;
 
 // Letzter Page-Error (Vue-Abstürze etc.) – wird vor jeder Navigation zurückgesetzt
 let lastPageErrors = [];
@@ -863,12 +861,6 @@ function loadSessionMeta() {
         refillFollowupPending = sessionMeta.refillFollowupPending === true ||
             sessionMeta.refillVerificationPending === true; // Migration von frühem 1.4.4-State
         lastRefillAt = Number.isFinite(sessionMeta.lastRefillAt) ? sessionMeta.lastRefillAt : 0;
-        lastRefillBeforeGb = Number.isFinite(sessionMeta.lastRefillBeforeGb)
-            ? sessionMeta.lastRefillBeforeGb
-            : NaN;
-        refillActivationCount = Number.isInteger(sessionMeta.refillActivationCount)
-            ? Math.max(0, sessionMeta.refillActivationCount)
-            : 0;
         lastTelegramStatusMessageId = Number.isInteger(sessionMeta.lastTelegramStatusMessageId)
             ? sessionMeta.lastTelegramStatusMessageId
             : null;
@@ -918,8 +910,6 @@ function saveSessionMeta() {
             lastSchedulingBaselineAt,
             refillFollowupPending,
             lastRefillAt,
-            lastRefillBeforeGb,
-            refillActivationCount,
             lastTelegramStatusMessageId,
             rateLimitBackoffCount,
             rateLimitBackoffUntil,
@@ -1980,7 +1970,6 @@ async function main() {
             datenVolumen = displayedDatenVolumen;
             let schedulingVolume = conservativeDatenVolumen;
             let schedulingBaselineAt = volumeMeasurementAt;
-            let refillClicked = false;
 
             if (!isNaN(refillVerfuegbar) && conservativeDatenVolumen <= REFILL_TRIGGER_GB) {
                 try {
@@ -1992,11 +1981,8 @@ async function main() {
 
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
                     const refillClickedAt = Date.now();
-                    refillClicked = true;
                     refillFollowupPending = true;
                     lastRefillAt = refillClickedAt;
-                    lastRefillBeforeGb = refillVorher;
-                    refillActivationCount++;
 
                     // Lidl aktualisiert die Anzeige nach dem Klick nicht zuverlässig live.
                     // Deshalb kein Reload: Nur die Terminplanung nimmt bis zum nächsten
@@ -2053,14 +2039,7 @@ async function main() {
             }
             if (lastRefillAt > 0) {
                 const refillTime = new Date(lastRefillAt).toLocaleString("de-DE");
-                const refillBefore = Number.isFinite(lastRefillBeforeGb)
-                    ? `, vorher ${lastRefillBeforeGb.toFixed(2)} GB`
-                    : "";
-                const refillState = refillClicked ? ", gerade aktiviert" : "";
-                const refillCount = refillActivationCount > 0
-                    ? `, Nr. ${refillActivationCount}`
-                    : "";
-                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}${refillState}${refillBefore}${refillCount}`;
+                finalStatusMessage += `\n🔄 Letzter Refill: ${refillTime}`;
             }
 
             const nextCheckAt = schedulingBaselineAt + getInterval(schedulingVolume) * 1000;
