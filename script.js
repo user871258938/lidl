@@ -102,7 +102,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.25";
+const version = "1.4.26";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 class MaintenanceModeError extends Error {
@@ -188,7 +188,6 @@ const MEMORY_RESTART_COOLDOWN_MS = getPositiveIntegerFromEnv(
     "MEMORY_RESTART_COOLDOWN_MINUTES",
     60
 ) * 60 * 1000;
-const SESSION_PERSIST_INTERVAL_MS = 15 * 60 * 1000;
 
 
 // Globale Variablen mit besserer Verwaltung
@@ -206,7 +205,7 @@ let lastMemoryRestartAt = 0;
 let lastMemoryWarningAt = 0;
 let highNodeMemorySamples = 0;
 let highBrowserMemorySamples = 0;
-let lastBrowserSessionPersistAt = 0;
+let lastPersistedSessionStorageHash = "";
 let lastSessionStorageDiagnosticHash = null;
 let lastAuthDiagnosticSignature = "";
 let restoredSessionNeedsFreshLogin = false;
@@ -1438,6 +1437,7 @@ async function persistCurrentBrowserSession(reason = "") {
         const updated = await context.storageState();
         let liveSessionStorageCaptured = false;
         let sessionStorageCount = 0;
+        let persistedSessionStorageHash = "";
 
         if (page && !page.isClosed() && isTrustedLidlUrl(page.url())) {
             const ssData = await page.evaluate(() => {
@@ -1449,6 +1449,7 @@ async function persistCurrentBrowserSession(reason = "") {
                 return result;
             });
             sessionStorageCount = Object.keys(ssData).length;
+            persistedSessionStorageHash = inspectSessionStorageData(ssData).hash;
             logSessionStorageDiagnostics(
                 reason || "live",
                 ssData,
@@ -1464,6 +1465,7 @@ async function persistCurrentBrowserSession(reason = "") {
             // Der normale Shutdown-/Restart-Pfad verwendet immer den Live-Stand.
             updated._sessionStorage = existing._sessionStorage;
             sessionStorageCount = Object.keys(existing._sessionStorage.data || {}).length;
+            persistedSessionStorageHash = inspectSessionStorageData(existing._sessionStorage.data).hash;
             logSessionStorageDiagnostics(`${reason || "Fallback"} (Fallback)`, existing._sessionStorage.data, "debug");
         }
 
@@ -1479,6 +1481,9 @@ async function persistCurrentBrowserSession(reason = "") {
         }
 
         fs.writeFileSync(cookiefile, JSON.stringify(updated, null, 2));
+        if (persistedSessionStorageHash) {
+            lastPersistedSessionStorageHash = persistedSessionStorageHash;
+        }
         const sessionLogMessage =
             `Session-Daten${reason ? ` ${reason}` : ""} aktualisiert ` +
             `(${sessionStorageCount} sessionStorage-Einträge${liveSessionStorageCaptured ? ", live" : ", Fallback"})`;
@@ -1624,6 +1629,7 @@ async function initializeBrowser(forceClean = true, options = {}) {
 
     const { preserveFingerprint = false } = options;
     restoredSessionNeedsFreshLogin = false;
+    lastPersistedSessionStorageHash = "";
 
     try {
         await closeBrowserSafely();
@@ -1769,6 +1775,8 @@ async function initializeBrowser(forceClean = true, options = {}) {
                     const ssOrigin = storageState._sessionStorage.origin;
                     const ssData = storageState._sessionStorage.data;
                     ssCount = Object.keys(ssData).length;
+                    const restoredDiagnostics = inspectSessionStorageData(ssData);
+                    lastPersistedSessionStorageHash = restoredDiagnostics.hash;
                     logSessionStorageDiagnostics("wiederhergestellt", ssData);
                     if (ssCount > 0) {
                         restoredSessionNeedsFreshLogin = true;
@@ -2752,12 +2760,20 @@ async function main() {
             } else {
                 rateLimitRecoverySuccessCount = 0;
             }
-            // Zusätzlich höchstens alle 15 Minuten sichern. Das erzeugt keinen
-            // Seitenaufruf, erfasst aber Token-Rotationen auch vor einem harten
-            // Prozessabbruch, bei dem kein Shutdown-Handler mehr laufen könnte.
-            if (Date.now() - lastBrowserSessionPersistAt >= SESSION_PERSIST_INTERVAL_MS) {
-                const liveSessionSaved = await persistCurrentBrowserSession("nach Datencheck");
-                if (liveSessionSaved) lastBrowserSessionPersistAt = Date.now();
+            // Den Live-Hash nach jedem erfolgreichen Check lokal auslesen. Das
+            // erzeugt keinen Seitenaufruf. Geschrieben wird ausschließlich bei
+            // einer echten Änderung des tokenhaltigen sessionStorage.
+            const liveSessionForPersistence = await getLiveSessionStorageSnapshot();
+            const liveSessionDiagnostics = liveSessionForPersistence?.diagnostics;
+            const sessionChanged =
+                liveSessionDiagnostics?.hasAccessToken === true &&
+                liveSessionDiagnostics.hash !== lastPersistedSessionStorageHash;
+            if (sessionChanged) {
+                logger.info(
+                    `Live-Session geändert (${lastPersistedSessionStorageHash || "kein Snapshot"}` +
+                    `→${liveSessionDiagnostics.hash}) - sichere neuen Tokenstand`
+                );
+                await persistCurrentBrowserSession("nach Session-Änderung");
             }
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
