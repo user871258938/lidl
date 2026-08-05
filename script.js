@@ -5,6 +5,7 @@ import axios from "axios";
 import dotenv from "dotenv";
 import * as fs from "fs";
 import path from "path";
+import { createHash } from "crypto";
 import { execFileSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -62,6 +63,11 @@ const DATA_RENDER_TIMEOUT_SECONDS = Math.max(15, configuredDataRenderTimeoutSeco
 const keepAliveEnabled = process.env.KEEPALIVE_ENABLED === "true";
 const RATE_LIMIT_BACKOFF_MINUTES = getPositiveIntegerFromEnv("RATE_LIMIT_BACKOFF_MINUTES", 20);
 const RATE_LIMIT_REPEAT_BACKOFF_MINUTES = getPositiveIntegerFromEnv("RATE_LIMIT_REPEAT_BACKOFF_MINUTES", 30);
+const MAINTENANCE_BACKOFF_MINUTES = getPositiveIntegerFromEnv("MAINTENANCE_BACKOFF_MINUTES", 15);
+const MAINTENANCE_BACKOFF_MS = MAINTENANCE_BACKOFF_MINUTES * 60 * 1000;
+const MAINTENANCE_NOTICE_COOLDOWN_MS = 60 * 60 * 1000;
+const TOKEN_PREFLIGHT_SECONDS = getPositiveIntegerFromEnv("TOKEN_PREFLIGHT_SECONDS", 300);
+const TOKEN_PREFLIGHT_COOLDOWN_MS = getPositiveIntegerFromEnv("TOKEN_PREFLIGHT_COOLDOWN_MINUTES", 15) * 60 * 1000;
 const RATE_LIMIT_DETECTION_STATE_VERSION = 2;
 const STARTUP_LOGIN_REQUEST_SLOTS = 2;
 const VOLUME_READING_TICK_GB = 0.00001; // 10 kB bei dezimaler GB-Anzeige
@@ -96,8 +102,17 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.20";
+const version = "1.4.24";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
+
+class MaintenanceModeError extends Error {
+    constructor(url = "") {
+        super("Lidl-Seite befindet sich im Wartungsmodus");
+        this.name = "MaintenanceModeError";
+        this.code = "LIDL_MAINTENANCE_MODE";
+        this.url = url;
+    }
+}
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 const cookiefile = path.join(scriptDirectory, "cookies.json");
@@ -151,15 +166,23 @@ function generateFingerprint() {
 const MAX_LOGIN_ATTEMPTS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const SESSION_KEEPALIVE_INTERVAL = 8 * 60 * 1000; // 8 Minuten (Keep-Alive nur bei langen Pausen nötig)
-const configuredBrowserRestartHours = Number.parseFloat(process.env.BROWSER_RESTART_INTERVAL_HOURS ?? "2");
+const configuredBrowserRestartHours = Number.parseFloat(process.env.BROWSER_RESTART_INTERVAL_HOURS ?? "0");
 const BROWSER_RESTART_INTERVAL = Number.isFinite(configuredBrowserRestartHours) && configuredBrowserRestartHours > 0
     ? configuredBrowserRestartHours * 60 * 60 * 1000
-    : 0; // 0 deaktiviert den planmäßigen Neustart; Standard sind zwei Stunden.
+    : 0; // 0 deaktiviert den planmäßigen Neustart; Session bleibt im laufenden Browser.
 const MEMORY_CHECK_INTERVAL = 10 * 60 * 1000; // 10 Minuten
 const MAX_MEMORY_MB = 500; // Maximaler Speicherverbrauch in MB
 const MEMORY_RESTART_THRESHOLD_MB = Math.max(
     MAX_MEMORY_MB + 50,
     getPositiveIntegerFromEnv("MEMORY_RESTART_THRESHOLD_MB", 600)
+);
+const BROWSER_MEMORY_RESTART_THRESHOLD_MB = getPositiveIntegerFromEnv(
+    "BROWSER_MEMORY_RESTART_THRESHOLD_MB",
+    1400
+);
+const MEMORY_RESTART_CONSECUTIVE_SAMPLES = getPositiveIntegerFromEnv(
+    "MEMORY_RESTART_CONSECUTIVE_SAMPLES",
+    3
 );
 const MEMORY_RESTART_COOLDOWN_MS = getPositiveIntegerFromEnv(
     "MEMORY_RESTART_COOLDOWN_MINUTES",
@@ -181,7 +204,12 @@ let isShuttingDown = false;
 let lastBrowserRestart = Date.now();
 let lastMemoryRestartAt = 0;
 let lastMemoryWarningAt = 0;
+let highNodeMemorySamples = 0;
+let highBrowserMemorySamples = 0;
 let lastBrowserSessionPersistAt = 0;
+let lastSessionStorageDiagnosticHash = null;
+let lastAuthDiagnosticSignature = "";
+let memorySamples = [];
 let mainRunInProgress = false;
 let keepAliveInProgress = false;
 let pendingPlannedRestart = false;
@@ -221,6 +249,11 @@ let nextScheduledRun = 0;
 let rateLimitBackoffCount = 0;
 let rateLimitBackoffUntil = 0;
 let rateLimitRecoverySuccessCount = 0;
+let rateLimitBackoffReason = "Rate-Limit";
+let maintenanceActive = false;
+let maintenanceBackoffUntil = 0;
+let lastMaintenanceNoticeAt = 0;
+let lastTokenPreflightAt = 0;
 
 // Zentrales Rolling-Window-Budget für alle Top-Level-Seitenaufrufe.
 // Die Log-Auswertung zeigte das praktische Limit nach ca. 38-40 Aufrufen in rund 60 Minuten.
@@ -282,6 +315,15 @@ function getRequestBudgetState(now = Date.now(), requestedSlots = 1) {
         waitUntil,
         blockedWindows
     };
+}
+
+function getRequestWindowUsage(now = Date.now()) {
+    prunePageRequestLog(now);
+    return RATE_LIMIT_WINDOWS.map(window => ({
+        label: window.label,
+        count: pageRequestLog.filter(entry => entry.time >= now - window.durationMs).length,
+        maxRequests: window.maxRequests
+    }));
 }
 
 async function reservePageRequest(label, requestedSlots = 1) {
@@ -404,10 +446,165 @@ function hasSessionRefreshError() {
     );
 }
 
+// Sichere Diagnose der Auth-Daten: Es werden niemals Tokenwerte geloggt,
+// sondern nur Hash, Größe, erkannte Felder und eine optionale Ablaufzeit.
+function inspectSessionStorageData(data) {
+    const entries = Object.entries(data || {}).sort(([a], [b]) => a.localeCompare(b));
+    const canonical = entries.map(([key, value]) => `${key}=${String(value)}`).join("\n");
+    const diagnostics = {
+        hash: createHash("sha256").update(canonical).digest("hex").slice(0, 12),
+        keys: entries.map(([key]) => key),
+        entries: entries.length,
+        bytes: Buffer.byteLength(canonical, "utf8"),
+        hasAccessToken: false,
+        hasRefreshToken: false,
+        expiresAt: 0
+    };
+
+    const considerExpiry = value => {
+        if (!Number.isFinite(value)) return;
+        const milliseconds = value > 100000000000 ? value : value * 1000;
+        if (milliseconds > Date.now() - 86400000 &&
+            (diagnostics.expiresAt === 0 || milliseconds < diagnostics.expiresAt)) {
+            diagnostics.expiresAt = milliseconds;
+        }
+    };
+    const inspectValue = (value, propertyName = "") => {
+        if (typeof value === "string") {
+            if (/access.?token/i.test(propertyName)) diagnostics.hasAccessToken = true;
+            if (/refresh.?token/i.test(propertyName)) diagnostics.hasRefreshToken = true;
+            const jwtParts = value.split(".");
+            if (jwtParts.length === 3) {
+                try {
+                    const payload = JSON.parse(Buffer.from(jwtParts[1], "base64url").toString("utf8"));
+                    considerExpiry(payload.exp);
+                } catch (_) {}
+            }
+            return;
+        }
+        if (!value || typeof value !== "object") return;
+        for (const [key, nestedValue] of Object.entries(value)) {
+            if (/access.?token/i.test(key)) diagnostics.hasAccessToken = true;
+            if (/refresh.?token/i.test(key)) diagnostics.hasRefreshToken = true;
+            if (/^(exp|expires.?at|expiration)$/i.test(key)) considerExpiry(Number(nestedValue));
+            inspectValue(nestedValue, key);
+        }
+    };
+
+    for (const [, rawValue] of entries) {
+        try {
+            inspectValue(JSON.parse(String(rawValue)));
+        } catch (_) {
+            inspectValue(String(rawValue));
+        }
+    }
+    return diagnostics;
+}
+
+function logSessionStorageDiagnostics(reason, data, level = "info") {
+    const diagnostics = inspectSessionStorageData(data);
+    const expiresIn = diagnostics.expiresAt > 0
+        ? `${Math.round((diagnostics.expiresAt - Date.now()) / 1000)}s`
+        : "unbekannt";
+    const message =
+        `SessionStorage-Diagnose${reason ? ` ${reason}` : ""}: ` +
+        `hash=${diagnostics.hash}, keys=${diagnostics.keys.join(",") || "-"}, ` +
+        `entries=${diagnostics.entries}, bytes=${diagnostics.bytes}, ` +
+        `access=${diagnostics.hasAccessToken ? "ja" : "nein"}, ` +
+        `refresh=${diagnostics.hasRefreshToken ? "ja" : "nein"}, expiresIn=${expiresIn}`;
+    if (lastSessionStorageDiagnosticHash && lastSessionStorageDiagnosticHash !== diagnostics.hash) {
+        logger.info(`SessionStorage-Hash geändert: ${lastSessionStorageDiagnosticHash}→${diagnostics.hash}`);
+    }
+    lastSessionStorageDiagnosticHash = diagnostics.hash;
+    if (level === "debug") logger.debug(message);
+    else logger.info(message);
+}
+
+async function getLiveSessionStorageSnapshot() {
+    if (!page || page.isClosed() || !isTrustedLidlUrl(page.url())) return null;
+    try {
+        const data = await page.evaluate(() => {
+            const result = {};
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const key = sessionStorage.key(i);
+                result[key] = sessionStorage.getItem(key);
+            }
+            return result;
+        });
+        return {
+            data,
+            diagnostics: inspectSessionStorageData(data)
+        };
+    } catch (error) {
+        logger.debug(`SessionStorage-Preflight nicht lesbar: ${error.message}`);
+        return null;
+    }
+}
+
+// Auth-Fehler sollen im Nachhinein nachvollziehbar sein, ohne Tokenwerte oder
+// Zugangsdaten zu protokollieren. Die Signatur verhindert identischen Spam bei
+// mehreren Recovery-Schritten desselben Navigationsversuchs.
+async function logAuthFailureDiagnostics(reason) {
+    const pageErrors = lastPageErrors
+        .slice(-4)
+        .map(error => String(error).replace(/\s+/g, " ").substring(0, 180))
+        .join(" | ") || "keine";
+    const network = getNavigationNetworkSummary();
+    const safeUrl = getCurrentDiagnosticUrl();
+    const budget = getRequestBudgetState(Date.now(), 1);
+    const signature = `${reason}|${safeUrl}|${pageErrors}|${network}`;
+    if (signature === lastAuthDiagnosticSignature) return;
+    lastAuthDiagnosticSignature = signature;
+
+    logger.warn(
+        `Auth-Diagnose ${reason}: URL=${safeUrl}; ` +
+        `Page-Errors=${pageErrors}; Netzwerk=${network}; ` +
+        `Budget=${budget.blockedWindows.join(", ") || "frei"}, ` +
+        `Wartezeit=${Math.ceil(budget.delayMs / 1000)}s`
+    );
+
+    if (page && !page.isClosed() && isTrustedLidlUrl(page.url())) {
+        try {
+            const ssData = await page.evaluate(() => {
+                const result = {};
+                for (let i = 0; i < sessionStorage.length; i++) {
+                    const key = sessionStorage.key(i);
+                    result[key] = sessionStorage.getItem(key);
+                }
+                return result;
+            });
+            logSessionStorageDiagnostics(`Auth-Fehler (${reason})`, ssData, "info");
+        } catch (error) {
+            logger.warn(`Auth-Diagnose SessionStorage nicht lesbar: ${error.message}`);
+        }
+    }
+}
+
+function logDataExtractionDiagnostics(usage, navigationState, startedAt, outcome = "unbekannt") {
+    const budget = getRequestBudgetState(Date.now(), 1);
+    const safeUrl = getCurrentDiagnosticUrl();
+    const pageErrors = lastPageErrors
+        .slice(-3)
+        .map(error => String(error).replace(/\s+/g, " ").substring(0, 140))
+        .join(" | ") || "keine";
+    const selectors = Array.isArray(usage?._debugSelectors)
+        ? JSON.stringify(usage._debugSelectors)
+        : "nicht-erfasst";
+    logger.debug(
+        `Daten-Diagnose ${outcome}: URL=${safeUrl}; navigation=${navigationState}; ` +
+        `render=${Math.max(0, (Date.now() - startedAt) / 1000).toFixed(1)}s; ` +
+        `tarif=${Number.isFinite(usage?.tarif?.available) ? usage.tarif.available : "NaN"}; ` +
+        `refill=${Number.isFinite(usage?.refill?.available) ? usage.refill.available : "NaN"}; ` +
+        `DOM=${selectors}; Page-Errors=${pageErrors}; Netzwerk=${getNavigationNetworkSummary()}; ` +
+        `Budget=${budget.blockedWindows.join(", ") || "frei"}`
+    );
+}
+
 function resetNavigationDiagnostics() {
     navigationDiagnosticsGeneration++;
     navigationNetworkEvents = [];
     navigationRetryAfterUntil = 0;
+    lastAuthDiagnosticSignature = "";
 }
 
 function sanitizeDiagnosticUrl(rawUrl) {
@@ -428,6 +625,23 @@ function isTrustedLidlUrl(rawUrl) {
         return hostname === "lidl-connect.de" || hostname.endsWith(".lidl-connect.de");
     } catch (_) {
         return false;
+    }
+}
+
+function isMaintenanceUrl(rawUrl) {
+    try {
+        const pathname = new URL(rawUrl).pathname.toLowerCase();
+        return pathname.includes("/wartung") || pathname.includes("/maintenance");
+    } catch (_) {
+        return false;
+    }
+}
+
+function getCurrentDiagnosticUrl() {
+    try {
+        return page && !page.isClosed() ? sanitizeDiagnosticUrl(page.url()) : "keine-seite";
+    } catch (_) {
+        return "keine-seite";
     }
 }
 
@@ -499,6 +713,9 @@ class CircuitBreaker {
             this.onSuccess();
             return result;
         } catch (error) {
+            if (error?.code === "LIDL_MAINTENANCE_MODE") {
+                throw error;
+            }
             this.onFailure();
             throw error;
         }
@@ -746,6 +963,7 @@ async function killExistingPlaywright() {
             // Auf Windows: taskkill für Playwright-Browser-Prozesse
             const browsers = [
                 { name: 'chrome.exe', display: 'Chrome' },
+                { name: 'chromium.exe', display: 'Chromium' },
                 { name: 'firefox.exe', display: 'Firefox' },
                 { name: 'msedgedriver.exe', display: 'Edge' }
             ];
@@ -763,13 +981,13 @@ async function killExistingPlaywright() {
             // Schritt 1: Hauptprozesse via -no-remote Flag per SIGTERM beenden
             // (gibt Firefox Chance, eigene Child-Prozesse sauber zu beenden)
             try {
-                const output = execSync(`pgrep -f 'firefox.*-no-remote' 2>/dev/null || true`, { encoding: 'utf-8' });
+                const output = execSync(`pgrep -f '(firefox|chromium|chrome).*(-no-remote|ms-playwright)' 2>/dev/null || true`, { encoding: 'utf-8' });
                 const pids = output.trim().split('\n').filter(l => l.length > 0 && /^\d+$/.test(l.trim())).map(l => l.trim());
                 for (const pid of pids) {
                     try {
                         execSync(`kill ${pid} 2>/dev/null || true`, { stdio: 'pipe' });
                         processesKilled++;
-                        logger.info(`Firefox Hauptprozess ${pid} beendet`);
+                        logger.info(`Playwright-Browserprozess ${pid} beendet`);
                     } catch (_) {}
                 }
             } catch (err) {
@@ -808,13 +1026,116 @@ function getMemoryUsage() {
     };
 }
 
+// Node-RSS allein enthält den Firefox-Prozess nicht. Für die Diagnose wird
+// deshalb zusätzlich der RSS der zu dieser Session gehörenden Playwright-
+// Browserprozesse ermittelt. Bei Fehlern wird bewusst nur "unbekannt" geliefert.
+function getBrowserProcessMemoryUsage() {
+    const result = { rss: 0, processes: 0 };
+    try {
+        if (process.platform === "linux" || process.platform === "darwin") {
+            const output = execFileSync("ps", ["-eo", "pid=,rss=,args="], {
+                encoding: "utf-8",
+                timeout: 5000
+            });
+            for (const line of output.split("\n")) {
+                const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+                if (!match) continue;
+                const commandLine = match[3];
+                if (!/(?:firefox|chrom(?:e|ium)|msedge)/i.test(commandLine)) continue;
+                if (!/(?:lidl-extender-data|ms-playwright)/i.test(commandLine)) continue;
+                result.rss += Number.parseInt(match[2], 10) / 1024;
+                result.processes++;
+            }
+        } else if (process.platform === "win32") {
+            const command = [
+                "Get-CimInstance Win32_Process",
+                "Where-Object { $_.Name -match 'firefox|chrome|chromium|msedge' -and $_.CommandLine -match 'lidl-extender-data|ms-playwright' }",
+                "Select-Object ProcessId,WorkingSetSize",
+                "ConvertTo-Json -Compress"
+            ].join(" | ");
+            const output = execFileSync(
+                "powershell.exe",
+                ["-NoProfile", "-NonInteractive", "-Command", command],
+                { encoding: "utf-8", timeout: 5000 }
+            ).trim();
+            if (output) {
+                const parsed = JSON.parse(output);
+                for (const processInfo of (Array.isArray(parsed) ? parsed : [parsed])) {
+                    if (!Number.isFinite(processInfo.WorkingSetSize)) continue;
+                    result.rss += processInfo.WorkingSetSize / 1024 / 1024;
+                    result.processes++;
+                }
+            }
+        }
+    } catch (_) {
+        return { rss: null, processes: null };
+    }
+    if (result.processes === 0) {
+        return { rss: null, processes: 0 };
+    }
+    return {
+        rss: Math.round(result.rss),
+        processes: result.processes
+    };
+}
+
 async function checkMemoryUsage() {
     const memory = getMemoryUsage();
+    const browserMemory = getBrowserProcessMemoryUsage();
     const now = Date.now();
-    logger.info(`Memory usage: RSS=${memory.rss}MB, Heap=${memory.heapUsed}/${memory.heapTotal}MB`);
+    const previous = memorySamples[memorySamples.length - 1];
+    const first = memorySamples[0];
+    const pageCount = context
+        ? (() => {
+            try { return context.pages().length; } catch (_) { return 0; }
+        })()
+        : 0;
+    memorySamples.push({
+        time: now,
+        ...memory,
+        browserRss: browserMemory.rss
+    });
+    if (memorySamples.length > 36) memorySamples.shift();
+    const deltaSinceLast = previous
+        ? `, Δ letzte Prüfung=${memory.rss - previous.rss >= 0 ? "+" : ""}${memory.rss - previous.rss}MB`
+        : "";
+    const deltaSinceFirst = first
+        ? `, Δ Verlauf=${memory.rss - first.rss >= 0 ? "+" : ""}${memory.rss - first.rss}MB/${Math.round((now - first.time) / 60000)}min`
+        : "";
+    const deltaBrowserSinceLast = previous && browserMemory.rss !== null && previous.browserRss !== null
+        ? `, Δ Browser-RSS letzte Prüfung=${browserMemory.rss - previous.browserRss >= 0 ? "+" : ""}${browserMemory.rss - previous.browserRss}MB`
+        : "";
+    logger.info(
+        `Memory usage: RSS=${memory.rss}MB, Heap=${memory.heapUsed}/${memory.heapTotal}MB, ` +
+        `External=${memory.external}MB, Seiten=${pageCount}, ` +
+        `Browser-RSS=${browserMemory.rss === null ? "unbekannt" : `${browserMemory.rss}MB/${browserMemory.processes} Prozesse`}` +
+        `${deltaSinceLast}${deltaSinceFirst}${deltaBrowserSinceLast}`
+    );
 
-    if (memory.rss > MAX_MEMORY_MB) {
-        if (now - lastMemoryWarningAt >= MEMORY_RESTART_COOLDOWN_MS) {
+    // Ein gleichmäßiger Anstieg ist für die Fehlersuche hilfreicher als nur
+    // ein einzelner Grenzwert. Die Samples bleiben klein und werden begrenzt.
+    const browserRssDelta = previous && browserMemory.rss !== null && previous.browserRss !== null
+        ? browserMemory.rss - previous.browserRss
+        : 0;
+    if (previous && (memory.rss - previous.rss >= 25 || browserRssDelta >= 50)) {
+        logger.warn(
+            `Memory-Trend: RSS stieg seit der letzten Prüfung um ${memory.rss - previous.rss}MB ` +
+            `(Heap ${memory.heapUsed - previous.heapUsed >= 0 ? "+" : ""}${memory.heapUsed - previous.heapUsed}MB, ` +
+            `Browser-RSS ${browserRssDelta >= 0 ? "+" : ""}${browserRssDelta}MB, Seiten=${pageCount})`
+        );
+    }
+
+    highNodeMemorySamples = memory.rss >= MEMORY_RESTART_THRESHOLD_MB
+        ? highNodeMemorySamples + 1
+        : 0;
+    highBrowserMemorySamples = browserMemory.rss !== null &&
+        browserMemory.rss >= BROWSER_MEMORY_RESTART_THRESHOLD_MB
+        ? highBrowserMemorySamples + 1
+        : 0;
+
+    if (memory.rss > MAX_MEMORY_MB || highBrowserMemorySamples > 0) {
+        let memoryRestartScheduled = false;
+        if (memory.rss > MAX_MEMORY_MB && now - lastMemoryWarningAt >= MEMORY_RESTART_COOLDOWN_MS) {
             lastMemoryWarningAt = now;
             logger.warn(`Hoher Speicherverbrauch: ${memory.rss}MB > ${MAX_MEMORY_MB}MB`);
             sendMessage(`⚠️ Hoher Speicherverbrauch: ${memory.rss}MB`, "warn");
@@ -830,18 +1151,24 @@ async function checkMemoryUsage() {
         // mit bestehender Session neu aufgebaut. Dadurch bleibt der reguläre
         // Datencheck unberührt und ein anstehender Refill-Folgecheck hat Vorrang.
         if (
-            memory.rss >= MEMORY_RESTART_THRESHOLD_MB &&
+            (
+                highNodeMemorySamples >= MEMORY_RESTART_CONSECUTIVE_SAMPLES ||
+                highBrowserMemorySamples >= MEMORY_RESTART_CONSECUTIVE_SAMPLES
+            ) &&
             now - lastMemoryRestartAt >= MEMORY_RESTART_COOLDOWN_MS &&
             !restartPromise &&
             !isShuttingDown
         ) {
             lastMemoryRestartAt = now;
+            const memoryReason = highBrowserMemorySamples >= MEMORY_RESTART_CONSECUTIVE_SAMPLES
+                ? `Browser-RSS ${browserMemory.rss}MB über ${BROWSER_MEMORY_RESTART_THRESHOLD_MB}MB`
+                : `Node-RSS ${memory.rss}MB über ${MEMORY_RESTART_THRESHOLD_MB}MB`;
             logger.warn(
-                `Speicher bleibt bei ${memory.rss}MB über ${MEMORY_RESTART_THRESHOLD_MB}MB - ` +
+                `${memoryReason} seit ${MEMORY_RESTART_CONSECUTIVE_SAMPLES} Prüfungen - ` +
                 "Browser-Neustart wird im Leerlauf eingeplant"
             );
             sendMessage(
-                `🔄 Speicherbereinigung: Browser-Neustart bei ${memory.rss}MB eingeplant`,
+                `🔄 Speicherbereinigung: Browser-Neustart eingeplant (${memoryReason})`,
                 "warn"
             );
             try {
@@ -850,6 +1177,9 @@ async function checkMemoryUsage() {
                     false,
                     true
                 );
+                memoryRestartScheduled = true;
+                highNodeMemorySamples = 0;
+                highBrowserMemorySamples = 0;
             } catch (restartError) {
                 lastMemoryRestartAt = 0;
                 logger.error(`Speicherbedingter Browser-Neustart fehlgeschlagen: ${restartError.message}`);
@@ -857,7 +1187,7 @@ async function checkMemoryUsage() {
         }
 
         // Kritischer Speicherverbrauch bleibt ein sofortigerer Fallback.
-        if (memory.rss > MAX_MEMORY_MB * 1.5) {
+        if (!memoryRestartScheduled && memory.rss > MAX_MEMORY_MB * 1.5) {
             logger.error("Kritischer Speicherverbrauch - Browser restart");
             await restartBrowserWhenIdle("Browser-Neustart wegen kritischem Speicherverbrauch", false);
         }
@@ -919,6 +1249,20 @@ function loadSessionMeta() {
             Number.isInteger(sessionMeta.rateLimitRecoverySuccessCount)
             ? Math.max(0, sessionMeta.rateLimitRecoverySuccessCount)
             : 0;
+        rateLimitBackoffReason = typeof sessionMeta.rateLimitBackoffReason === "string"
+            ? sessionMeta.rateLimitBackoffReason.substring(0, 80)
+            : "Rate-Limit";
+        maintenanceBackoffUntil = Number.isFinite(sessionMeta.maintenanceBackoffUntil) &&
+            sessionMeta.maintenanceBackoffUntil > now
+            ? sessionMeta.maintenanceBackoffUntil
+            : 0;
+        maintenanceActive = maintenanceBackoffUntil > 0 || sessionMeta.maintenanceActive === true;
+        lastMaintenanceNoticeAt = Number.isFinite(sessionMeta.lastMaintenanceNoticeAt)
+            ? sessionMeta.lastMaintenanceNoticeAt
+            : 0;
+        lastTokenPreflightAt = Number.isFinite(sessionMeta.lastTokenPreflightAt)
+            ? sessionMeta.lastTokenPreflightAt
+            : 0;
 
         logger.info(`Session-Metadaten geladen (${pageRequestLog.length} Seitenaufrufe im Rolling Window)`);
     } catch (error) {
@@ -947,7 +1291,12 @@ function saveSessionMeta() {
             lastTelegramStatusMessageId,
             rateLimitBackoffCount,
             rateLimitBackoffUntil,
-            rateLimitRecoverySuccessCount
+            rateLimitRecoverySuccessCount,
+            rateLimitBackoffReason,
+            maintenanceActive,
+            maintenanceBackoffUntil,
+            lastMaintenanceNoticeAt,
+            lastTokenPreflightAt
         };
         fs.writeFileSync(sessionMetaFile, JSON.stringify(sessionMeta, null, 2));
     } catch (error) {
@@ -955,9 +1304,49 @@ function saveSessionMeta() {
     }
 }
 
+function enterMaintenanceBackoff(error) {
+    const now = Date.now();
+    const shouldNotify = !maintenanceActive ||
+        now - lastMaintenanceNoticeAt >= MAINTENANCE_NOTICE_COOLDOWN_MS;
+    maintenanceActive = true;
+    maintenanceBackoffUntil = now + MAINTENANCE_BACKOFF_MS;
+
+    logger.warn(
+        `Lidl-Wartungsseite erkannt (${error?.url ? sanitizeDiagnosticUrl(error.url) : "unbekannte-url"}) - ` +
+        `keine Login-/Browser-Recovery, nächster Versuch in ${MAINTENANCE_BACKOFF_MINUTES} Minuten`
+    );
+    if (shouldNotify) {
+        lastMaintenanceNoticeAt = now;
+        sendMessage(
+            `🛠️ Lidl-Seite im Wartungsmodus – nächster Versuch in ${MAINTENANCE_BACKOFF_MINUTES} Minuten.`,
+            "warn"
+        );
+    }
+    saveSessionMeta();
+    return {
+        datenVolumen: 0,
+        statusMessage: null,
+        maintenanceBackoffSeconds: Math.ceil(MAINTENANCE_BACKOFF_MS / 1000)
+    };
+}
+
+function markMaintenanceRecovered() {
+    if (!maintenanceActive && maintenanceBackoffUntil === 0) return;
+    maintenanceActive = false;
+    maintenanceBackoffUntil = 0;
+    lastMaintenanceNoticeAt = 0;
+    logger.info("Lidl-Wartungsmodus beendet - regulärer Datencheck wieder möglich");
+}
+
 // Verbessertes Keep-Alive mit Fehlerbehandlung
 async function keepSessionAlive() {
     if (!page || page.isClosed() || isShuttingDown) return;
+
+    if (Date.now() < maintenanceBackoffUntil) {
+        logger.debug("Keep-Alive übersprungen - Lidl-Wartungsmodus aktiv");
+        updateHeartbeat();
+        return;
+    }
 
     if (mainRunInProgress || keepAliveInProgress || restartPromise) {
         logger.debug("Keep-Alive übersprungen - Browseroperation läuft bereits");
@@ -1058,6 +1447,11 @@ async function persistCurrentBrowserSession(reason = "") {
                 return result;
             });
             sessionStorageCount = Object.keys(ssData).length;
+            logSessionStorageDiagnostics(
+                reason || "live",
+                ssData,
+                reason === "nach Datencheck" ? "debug" : "info"
+            );
             updated._sessionStorage = {
                 origin: new URL(page.url()).origin,
                 data: ssData
@@ -1068,6 +1462,7 @@ async function persistCurrentBrowserSession(reason = "") {
             // Der normale Shutdown-/Restart-Pfad verwendet immer den Live-Stand.
             updated._sessionStorage = existing._sessionStorage;
             sessionStorageCount = Object.keys(existing._sessionStorage.data || {}).length;
+            logSessionStorageDiagnostics(`${reason || "Fallback"} (Fallback)`, existing._sessionStorage.data, "debug");
         }
 
         if (currentFingerprint) {
@@ -1132,6 +1527,7 @@ async function restartBrowser(forceClean = true) {
 
         try {
             const memoryBeforeRestart = getMemoryUsage();
+            const browserMemoryBeforeRestart = getBrowserProcessMemoryUsage();
             if (!forceClean) {
                 const liveSessionSaved = await persistCurrentBrowserSession("vor Browser-Neustart");
                 if (!liveSessionSaved) {
@@ -1160,9 +1556,15 @@ async function restartBrowser(forceClean = true) {
                 if (global.gc) global.gc();
                 await delay(1000);
                 const memoryAfterRestart = getMemoryUsage();
+                const browserMemoryAfterRestart = getBrowserProcessMemoryUsage();
                 logger.info(
                     `Speicher vor/nach Browser-Neustart: RSS ${memoryBeforeRestart.rss}→${memoryAfterRestart.rss}MB, ` +
                     `Heap ${memoryBeforeRestart.heapUsed}→${memoryAfterRestart.heapUsed}MB`
+                );
+                logger.info(
+                    `Browser-Speicher vor/nach Neustart: ` +
+                    `${browserMemoryBeforeRestart.rss === null ? "unbekannt" : `${browserMemoryBeforeRestart.rss}MB`} -> ` +
+                    `${browserMemoryAfterRestart.rss === null ? "unbekannt" : `${browserMemoryAfterRestart.rss}MB`}`
                 );
                 logger.info("Browser erfolgreich neu gestartet");
                 sendMessage("🔄 Browser wurde neu gestartet", "info");
@@ -1328,6 +1730,7 @@ async function initializeBrowser(forceClean = true) {
                     const ssOrigin = storageState._sessionStorage.origin;
                     const ssData = storageState._sessionStorage.data;
                     ssCount = Object.keys(ssData).length;
+                    logSessionStorageDiagnostics("wiederhergestellt", ssData);
                     if (ssCount > 0) {
                         await context.addInitScript(({ origin, data }) => {
                             if (window.location.origin === origin) {
@@ -1418,12 +1821,21 @@ async function initializeBrowser(forceClean = true) {
         });
 
         page.on('pageerror', error => {
-            logger.error(`Page error: ${error.message}`);
-            lastPageErrors.push(error.message);
+            const message = String(error.message || error).replace(/\s+/g, " ").substring(0, 500);
+            logger.error(
+                `Page error: ${message} ` +
+                `(URL=${getCurrentDiagnosticUrl()}, Netzwerk=${getNavigationNetworkSummary()})`
+            );
+            lastPageErrors.push(message);
+            if (lastPageErrors.length > 20) lastPageErrors.shift();
         });
 
         page.on('crash', () => {
-            logger.error("Page crashed!");
+            const memory = getMemoryUsage();
+            logger.error(
+                `Page crashed! (URL=${getCurrentDiagnosticUrl()}, ` +
+                `RSS=${memory.rss}MB, Page-Errors=${lastPageErrors.length})`
+            );
             consecutiveErrors++;
         });
 
@@ -1437,6 +1849,11 @@ async function initializeBrowser(forceClean = true) {
 
 // Wartet auf vollständiges Rendern der Vue-Daten auf der Übersichtsseite
 async function navigateAndWaitForData(navigationStartedAt = Date.now()) {
+    if (page && isMaintenanceUrl(page.url())) {
+        logger.warn(`Wartungsseite direkt erkannt: ${sanitizeDiagnosticUrl(page.url())}`);
+        return "maintenance";
+    }
+
     // Zuerst ausschließlich auf echte Zahlen (oder ein sichtbares Login-Formular)
     // warten. Der Lidl-Platzhalter ist während des Vue-Ladens kurz sichtbar und darf
     // deshalb nicht selbst das Wait vorzeitig beenden.
@@ -1450,6 +1867,9 @@ async function navigateAndWaitForData(navigationStartedAt = Date.now()) {
         const readyStateHandle = await page.waitForFunction(() => {
             const visible = el => !!el &&
                 !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            const maintenance = /(?:wartung|maintenance)/i.test(location.pathname) ||
+                /(?:wartung|maintenance)/i.test(document.title || '');
+            if (maintenance) return 'maintenance';
             const loginForm = document.querySelector('app-login-v2, .login-wrapper');
             if (visible(loginForm)) {
                 return 'login';
@@ -1492,6 +1912,9 @@ async function navigateAndWaitForData(navigationStartedAt = Date.now()) {
             const state = await page.evaluate(() => {
                 const visible = el => !!el &&
                     !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const maintenance = /(?:wartung|maintenance)/i.test(location.pathname) ||
+                    /(?:wartung|maintenance)/i.test(document.title || '');
+                if (maintenance) return 'maintenance';
                 const loginForm = document.querySelector('app-login-v2, .login-wrapper');
                 if (visible(loginForm)) return 'login';
 
@@ -1518,7 +1941,7 @@ async function navigateAndWaitForData(navigationStartedAt = Date.now()) {
                 ) ? 'placeholder' : 'timeout';
             });
 
-            if (state === 'data' || state === 'login') return state;
+            if (state === 'data' || state === 'login' || state === 'maintenance') return state;
             stablePlaceholderSamples = state === 'placeholder'
                 ? stablePlaceholderSamples + 1
                 : 0;
@@ -1548,6 +1971,9 @@ async function waitForLoginSuccess(timeoutMs = 30000, startedOnOverview = false)
             const state = await page.evaluate(() => {
                 const visible = el => !!el &&
                     !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const maintenance = /(?:wartung|maintenance)/i.test(location.pathname) ||
+                    /(?:wartung|maintenance)/i.test(document.title || '');
+                if (maintenance) return 'maintenance';
                 const loginForm = document.querySelector('app-login-v2, .login-wrapper');
                 const loginVisible = visible(loginForm);
                 const dataCandidates = [
@@ -1569,6 +1995,8 @@ async function waitForLoginSuccess(timeoutMs = 30000, startedOnOverview = false)
                     hasVisibleConsumptionRoot: consumptionRoots.some(visible)
                 };
             });
+
+            if (state === 'maintenance') return state;
 
             const successTargetReached =
                 state.hasTariffNumber ||
@@ -1597,7 +2025,7 @@ async function waitForLoginSuccess(timeoutMs = 30000, startedOnOverview = false)
 }
 
 // Verbesserte Login-Funktion mit Timeout und Retry-Logik
-async function performLogin(recoveryAttempt = 0) {
+async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
     if (isShuttingDown) return false;
 
     try {
@@ -1607,13 +2035,17 @@ async function performLogin(recoveryAttempt = 0) {
         } catch (_) {}
 
         if (page.url().startsWith(uebersichtUrl)) {
-            if (!loginFormAlreadyVisible) {
+            if (!loginFormAlreadyVisible && !forceFreshLogin) {
                 logger.info("Bereits auf der Übersichtsseite, kein Login nötig");
                 loginAttempts = 0;
                 authRecoveryNoticeActive = false;
                 return true;
             }
-            logger.info("Auf Übersichts-URL aber Login-Formular sichtbar - verwende vorhandenes Formular direkt");
+            if (loginFormAlreadyVisible) {
+                logger.info("Auf Übersichts-URL aber Login-Formular sichtbar - verwende vorhandenes Formular direkt");
+            } else {
+                logger.info("Token läuft bald ab - proaktive Neuanmeldung ersetzt diesen regulären Datenreload");
+            }
         }
 
         const loginPromise = (async () => {
@@ -1622,6 +2054,16 @@ async function performLogin(recoveryAttempt = 0) {
                 logger.info("Navigiere zur Login-Seite...");
                 // Zwei Slots freihalten: Login-Seite plus möglicher Formular-Submit.
                 const loginNavigationStartedAt = await reservePageRequest('login', 2);
+                if (forceFreshLogin) {
+                    // Erst nach der Request-Budget-Wartezeit löschen. So bleibt die
+                    // laufende Sitzung während einer längeren Drosselung nutzbar.
+                    await page.evaluate(() => {
+                        sessionStorage.clear();
+                        localStorage.clear();
+                    });
+                    await context.clearCookies();
+                    logger.info("Lokale Browser-Anmeldung für proaktiven frischen Login entfernt");
+                }
                 resetPageErrors();
                 resetNavigationDiagnostics();
                 await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
@@ -1629,6 +2071,9 @@ async function performLogin(recoveryAttempt = 0) {
                 // Gültige Session? → DOM-Check: Login-Formular sichtbar?
                 // URL-Check reicht nicht: Login-Form kann auf jeder URL erscheinen
                 const loginPageState = await navigateAndWaitForData(loginNavigationStartedAt);
+                if (loginPageState === 'maintenance') {
+                    throw new MaintenanceModeError(page.url());
+                }
                 hatLoginFormularNachGoto = loginPageState === 'login';
                 const authenticatedOverviewState =
                     page.url().startsWith(uebersichtUrl) &&
@@ -1647,12 +2092,23 @@ async function performLogin(recoveryAttempt = 0) {
             if (!hatLoginFormularNachGoto) {
                 logger.info(`Session noch gültig (kein Login-Formular) - URL: ${page.url()}`);
                 overviewFreshFromLogin = page.url().startsWith(uebersichtUrl);
+                if (forceFreshLogin) {
+                    await persistCurrentBrowserSession("nach proaktiver Neuanmeldung");
+                }
                 loginAttempts = 0;
                 authRecoveryNoticeActive = false;
                 return true;
             }
 
-            // Login-Formular erkannt → tatsächlicher Login erforderlich
+            // Login-Formular erkannt → tatsächlicher Login erforderlich. Auch
+            // ohne Vue-Fehler wird der Kontext einmalig protokolliert; so lässt
+            // sich später zwischen normaler Session-Ablaufzeit und Tokenfehler
+            // unterscheiden.
+            if (hatLoginFormularNachGoto) {
+                await logAuthFailureDiagnostics(
+                    hasSessionRefreshError() ? "Session-Erneuerung" : "Login-Formular erkannt"
+                );
+            }
             if (hasSessionRefreshError() && !authRecoveryNoticeActive) {
                 authRecoveryNoticeActive = true;
                 logger.warn("Gespeicherte Sitzung konnte nicht erneuert werden - automatische Neuanmeldung läuft");
@@ -1693,6 +2149,9 @@ async function performLogin(recoveryAttempt = 0) {
             );
 
             const loginSuccessState = await waitForLoginSuccess(30000, loginStartedOnOverview);
+            if (loginSuccessState === 'maintenance') {
+                throw new MaintenanceModeError(page.url());
+            }
             if (!loginSuccessState) {
                 const loginStillVisible = await isLoginFormVisible().catch(() => false);
                 throw new Error(
@@ -1716,6 +2175,9 @@ async function performLogin(recoveryAttempt = 0) {
                 // Auch nach goto Übersicht: Ein sichtbares Login-Formular bedeutet
                 // fehlgeschlagene Session; ein verborgen gemountetes Element nicht.
                 const overviewState = await navigateAndWaitForData(overviewNavigationStartedAt);
+                if (overviewState === 'maintenance') {
+                    throw new MaintenanceModeError(page.url());
+                }
                 if (overviewState === 'login') {
                     throw new Error(`Navigation zur Übersicht fehlgeschlagen - Login-Formular erschienen (URL: ${page.url()})`);
                 }
@@ -1739,6 +2201,9 @@ async function performLogin(recoveryAttempt = 0) {
         return await loginPromise;
 
     } catch (error) {
+        if (error?.code === "LIDL_MAINTENANCE_MODE") {
+            throw error;
+        }
         if (loginAttempts < MAX_LOGIN_ATTEMPTS) {
             logger.warn(`Login-Versuch ${loginAttempts}/${MAX_LOGIN_ATTEMPTS} nicht erfolgreich: ${error.message}`);
         } else {
@@ -1749,6 +2214,7 @@ async function performLogin(recoveryAttempt = 0) {
         // Fehlerzustand der Login-App: mit frischer Sitzung neu aufbauen und direkt
         // erneut anmelden. Das ist kein Browser-Crash und wird auch nicht so gemeldet.
         if (lastPageErrors.length > 0) {
+            await logAuthFailureDiagnostics("Login-Recovery");
             if (recoveryAttempt >= MAX_LOGIN_ATTEMPTS - 1) {
                 logger.error(`Login-App nach ${recoveryAttempt + 1} Recovery-Versuchen weiterhin fehlerhaft - breche Login-Zyklus ab`);
                 return false;
@@ -1807,7 +2273,29 @@ async function main() {
             // Login durchführen (bei forceClean=true neu, bei forceClean=false Session wiederverwenden)
             logger.info("Prüfe Session...");
             overviewFreshFromLogin = false;
-            const loginSuccess = await performLogin();
+            let forceFreshLogin = false;
+            if (page.url().startsWith(uebersichtUrl)) {
+                const liveSession = await getLiveSessionStorageSnapshot();
+                const expiresAt = liveSession?.diagnostics?.expiresAt || 0;
+                const expiresInSeconds = expiresAt > 0
+                    ? Math.floor((expiresAt - Date.now()) / 1000)
+                    : null;
+                if (
+                    expiresInSeconds !== null &&
+                    expiresInSeconds <= TOKEN_PREFLIGHT_SECONDS &&
+                    Date.now() - lastTokenPreflightAt >= TOKEN_PREFLIGHT_COOLDOWN_MS
+                ) {
+                    const budget = getRequestBudgetState(Date.now(), 2);
+                    forceFreshLogin = true;
+                    lastTokenPreflightAt = Date.now();
+                    logger.info(
+                        `Token-Preflight: Ablauf in ${expiresInSeconds}s, ` +
+                        `Request-Budget-Wartezeit aktuell ${Math.ceil(budget.delayMs / 1000)}s`
+                    );
+                    saveSessionMeta();
+                }
+            }
+            const loginSuccess = await performLogin(0, forceFreshLogin);
             if (!loginSuccess) {
                 throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
             }
@@ -1836,6 +2324,9 @@ async function main() {
                 ? pageRequestLog[pageRequestLog.length - 1].time
                 : Date.now();
             let navigationState = await navigateAndWaitForData(dataNavigationStartedAt);
+            if (navigationState === 'maintenance') {
+                throw new MaintenanceModeError(page.url());
+            }
 
             // Ein Session-Redirect kann erst nach dem Übersichts-Reload sichtbar
             // werden. Das bereits geladene Formular direkt im selben Lauf verwenden:
@@ -1851,6 +2342,9 @@ async function main() {
                     ? pageRequestLog[pageRequestLog.length - 1].time
                     : Date.now();
                 navigationState = await navigateAndWaitForData(dataNavigationStartedAt);
+                if (navigationState === 'maintenance') {
+                    throw new MaintenanceModeError(page.url());
+                }
                 if (navigationState === 'login') {
                     throw new Error("Login-Formular nach erfolgreicher Neuanmeldung weiterhin sichtbar");
                 }
@@ -1965,6 +2459,21 @@ async function main() {
 			let datenVerfuegbar = usage.tarif.available;
 			let refillVerfuegbar = usage.refill.available;
             const hasHttp429 = navigationNetworkEvents.some(event => event.status === 429);
+            const hasHttp5xx = navigationNetworkEvents.some(event => event.status >= 500 && event.status < 600);
+			const requestWindowUsage = getRequestWindowUsage();
+			const requestBudgetNearLimit = requestWindowUsage.some(window => {
+				// Im kurzen Fenster erst den letzten freien Slot als kritisch werten.
+				// Beim 60-Minuten-Fenster sind zwei Slots Reserve relevant, weil eine
+				// abgelaufene Session Navigation plus möglichen Login-Submit benötigt.
+				const reserveMargin = window.label === "60min" ? 2 : 1;
+				return window.count >= Math.max(1, window.maxRequests - reserveMargin);
+			});
+			logDataExtractionDiagnostics(
+				usage,
+				navigationState,
+				dataNavigationStartedAt,
+				usage._rateLimited ? "rate-limit-placeholder" : (isNaN(datenVerfuegbar) ? "NaN" : "erfolgreich")
+			);
 
 			// Ein explizites HTTP 429 ist auch ohne fertig gerenderten Platzhalter
             // eindeutig. Ohne 429 gilt nur der über 25+s stabil bestätigte,
@@ -1973,13 +2482,22 @@ async function main() {
 				rateLimitBackoffCount++;
                 rateLimitRecoverySuccessCount = 0;
                 const placeholderDurationSeconds = ((Date.now() - dataNavigationStartedAt) / 1000).toFixed(1);
+                const classification = hasHttp429
+                    ? "Bestätigtes Rate-Limit"
+                    : requestBudgetNearLimit
+                        ? "Wahrscheinliches Rate-Limit"
+                        : hasHttp5xx
+                            ? "Lidl-API-Fehler mit Rate-Limit-Platzhalter"
+                            : "Unbestätigter Rate-Limit-Platzhalter";
+                rateLimitBackoffReason = classification;
                 logger.warn(
                     hasHttp429
                         ? `HTTP 429 nach ${placeholderDurationSeconds}s bestätigt und keine Tarifzahl vorhanden`
-                        : `Rate-Limit-Platzhalter nach ${placeholderDurationSeconds}s weiterhin sichtbar und keine Tarifzahl vorhanden`
+                        : `${classification} nach ${placeholderDurationSeconds}s weiterhin sichtbar und keine Tarifzahl vorhanden`
                 );
                 logger.warn(
-                    `Rate-Limit-Netzwerkdiagnose (${hasHttp429 ? "HTTP 429 bestätigt" : "kein HTTP 429 erfasst"}): ` +
+                    `Rate-Limit-Netzwerkdiagnose (${hasHttp429 ? "HTTP 429 bestätigt" : "kein HTTP 429 erfasst"}; ` +
+                    `Budget ${requestWindowUsage.map(window => `${window.label}=${window.count}/${window.maxRequests}`).join(", ")}): ` +
                     getNavigationNetworkSummary()
                 );
 				logRateLimitStats();
@@ -1997,9 +2515,9 @@ async function main() {
 				rateLimitBackoffUntil = Date.now() + effectiveBackoffMs;
 				lastMainRunTime = Date.now();
                 saveSessionMeta();
-				logger.warn(`⏳ Rate-Limit erkannt (${rateLimitBackoffCount}x) - Warte ${effectiveBackoffMinutes} Minuten...`);
-                logger.error("Während eines aktiven Rate-Limits kann ein durchgehender Download ohne externe Drosselung nicht garantiert werden.");
-				sendMessage(`⏳ Rate-Limit erkannt (${rateLimitBackoffCount}x) - Pause ${effectiveBackoffMinutes} Minuten`, "warn");
+				logger.warn(`⏳ ${classification} (${rateLimitBackoffCount}x) - Schutzpause ${effectiveBackoffMinutes} Minuten...`);
+                logger.error("Während dieses Schutz-Backoffs kann ein durchgehender Download ohne externe Drosselung nicht garantiert werden.");
+				sendMessage(`⏳ ${classification} - Pause ${effectiveBackoffMinutes} Minuten`, "warn");
 				return {
                     datenVolumen: 0,
                     statusMessage: null,
@@ -2119,6 +2637,9 @@ async function main() {
                 }
             }
 
+            const maintenanceWasActive = maintenanceActive;
+            markMaintenanceRecovered();
+            if (maintenanceWasActive) saveSessionMeta();
             lastKnownDatenVolumen = datenVolumen; // Für Rate-Limit-Bucket-Zuordnung
             lastVolumeMeasurementAt = volumeMeasurementAt;
             lastSchedulingVolume = schedulingVolume;
@@ -2132,12 +2653,13 @@ async function main() {
                 }
 
                 if (rateLimitRecoverySuccessCount >= 2) {
-                    logger.info("Rate-Limit-Recovery bestätigt: zwei reguläre Datenchecks erfolgreich");
+                    logger.info(`${rateLimitBackoffReason}-Recovery bestätigt: zwei reguläre Datenchecks erfolgreich`);
                     rateLimitBackoffCount = 0;
                     rateLimitRecoverySuccessCount = 0;
+                    rateLimitBackoffReason = "Rate-Limit";
                 } else {
                     logger.info(
-                        `Erster lesbarer Stand nach Rate-Limit; Recovery bleibt bis zu ` +
+                        `Erster lesbarer Stand nach ${rateLimitBackoffReason}; Recovery bleibt bis zu ` +
                         `zwei regulären Datenchecks aktiv (${rateLimitRecoverySuccessCount}/2)`
                     );
                 }
@@ -2177,6 +2699,9 @@ async function main() {
         });
 
     } catch (error) {
+        if (error?.code === "LIDL_MAINTENANCE_MODE") {
+            return enterMaintenanceBackoff(error);
+        }
         sendMessage(`🚨 Fehler aufgetreten: ${error.message}`, "error");
         logger.error(`Fehler in main(): ${error.message}`);
         consecutiveErrors++;
@@ -2523,6 +3048,7 @@ function stopTimers() {
 // Verbesserte Hauptschleife mit besserer Fehlerbehandlung
 async function start() {
     logger.info("🚀 Starting lidl-extender script v" + version);
+    logger.info(`Browser-Konfiguration: ${browserType}`);
     logger.info(
         `Sicherheitsplanung: max. ${MAX_DOWNLOAD_MBIT} Mbit/s, ` +
         `${REFILL_SAFETY_RESERVE_GB} GB Reserve, Refill ab ${REFILL_TRIGGER_GB.toFixed(3)} GB, ` +
@@ -2538,6 +3064,16 @@ async function start() {
     }
     logger.info(
         `Request-Budget: ${RATE_LIMIT_WINDOWS.map(window => `${window.maxRequests}/${window.label}`).join(", ")}`
+    );
+    logger.info(
+        `Session-Schutz: Token-Preflight ${TOKEN_PREFLIGHT_SECONDS}s vor Ablauf, ` +
+        `Cooldown ${Math.round(TOKEN_PREFLIGHT_COOLDOWN_MS / 60000)}min; ` +
+        `Wartungs-Backoff ${MAINTENANCE_BACKOFF_MINUTES}min`
+    );
+    logger.info(
+        `Speicher-Recovery: Node-RSS ab ${MEMORY_RESTART_THRESHOLD_MB}MB, ` +
+        `Browser-RSS ab ${BROWSER_MEMORY_RESTART_THRESHOLD_MB}MB, ` +
+        `jeweils nach ${MEMORY_RESTART_CONSECUTIVE_SAMPLES} aufeinanderfolgenden 10-Minuten-Messungen`
     );
     const oneRefillInterval = getPhysicalSafeIntervalSeconds(REFILL_EXPECTED_GB);
     const requiredChecksPerHour = 3600 / Math.max(1, oneRefillInterval);
@@ -2603,6 +3139,14 @@ async function start() {
             return;
         }
 
+        if (maintenanceBackoffUntil > Date.now()) {
+            const remainingSeconds = Math.ceil((maintenanceBackoffUntil - Date.now()) / 1000);
+            logger.info(`Wartungsmodus-Backoff aktiv - nächster Versuch in ${remainingSeconds}s`);
+            nextScheduledRun = maintenanceBackoffUntil;
+            mainTimeout = setTimeout(runMain, remainingSeconds * 1000);
+            return;
+        }
+
         if (rateLimitBackoffUntil > Date.now()) {
             const remainingSeconds = Math.ceil((rateLimitBackoffUntil - Date.now()) / 1000);
             logger.info(`Persistierter Rate-Limit-Backoff aktiv - nächster Versuch in ${remainingSeconds}s`);
@@ -2633,7 +3177,10 @@ async function start() {
             forceNewMessage = lastResult.forceNewMessage ?? false;
 
             // Rate-Limit Backoff als Interval verwenden
-            if (lastResult.rateLimitBackoffSeconds) {
+            if (lastResult.maintenanceBackoffSeconds) {
+                nextInterval = lastResult.maintenanceBackoffSeconds;
+                hasExplicitInterval = true;
+            } else if (lastResult.rateLimitBackoffSeconds) {
                 nextInterval = lastResult.rateLimitBackoffSeconds;
                 hasExplicitInterval = true;
             } else if (lastResult.nanRetryIn) {
@@ -2684,6 +3231,7 @@ async function start() {
         // Timer-Restarts dürfen keinen Datencheck oder Refill unterbrechen.
         if (
             !isShuttingDown &&
+            !maintenanceActive &&
             pendingPlannedRestart &&
             (!refillFollowupPending || pendingRestartMustRun)
         ) {
@@ -2751,6 +3299,8 @@ async function start() {
                     statusMessage += `\n⏰ Nächste Prüfung in ${nextInterval} Sekunden.`;
                     await sendFreshStatusMessage(statusMessage);
                 }
+            } else if (lastResult?.maintenanceBackoffSeconds) {
+                logger.info(`Wartungsmodus aktiv - nächster Versuch in ${nextInterval} Sekunden`);
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
             }
