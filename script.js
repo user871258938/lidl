@@ -102,7 +102,7 @@ const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 const loginUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect.html";
 const uebersichtUrl = "https://kundenkonto.lidl-connect.de/mein-lidl-connect/uebersicht.html";
 
-const version = "1.4.24";
+const version = "1.4.25";
 const scriptUrl = "https://raw.githubusercontent.com/user871258938/lidl/main/script.js";
 
 class MaintenanceModeError extends Error {
@@ -209,6 +209,7 @@ let highBrowserMemorySamples = 0;
 let lastBrowserSessionPersistAt = 0;
 let lastSessionStorageDiagnosticHash = null;
 let lastAuthDiagnosticSignature = "";
+let restoredSessionNeedsFreshLogin = false;
 let memorySamples = [];
 let mainRunInProgress = false;
 let keepAliveInProgress = false;
@@ -544,7 +545,7 @@ async function getLiveSessionStorageSnapshot() {
 // Auth-Fehler sollen im Nachhinein nachvollziehbar sein, ohne Tokenwerte oder
 // Zugangsdaten zu protokollieren. Die Signatur verhindert identischen Spam bei
 // mehreren Recovery-Schritten desselben Navigationsversuchs.
-async function logAuthFailureDiagnostics(reason) {
+async function logAuthFailureDiagnostics(reason, level = "warn") {
     const pageErrors = lastPageErrors
         .slice(-4)
         .map(error => String(error).replace(/\s+/g, " ").substring(0, 180))
@@ -556,7 +557,8 @@ async function logAuthFailureDiagnostics(reason) {
     if (signature === lastAuthDiagnosticSignature) return;
     lastAuthDiagnosticSignature = signature;
 
-    logger.warn(
+    const logDiagnostic = level === "info" ? logger.info.bind(logger) : logger.warn.bind(logger);
+    logDiagnostic(
         `Auth-Diagnose ${reason}: URL=${safeUrl}; ` +
         `Page-Errors=${pageErrors}; Netzwerk=${network}; ` +
         `Budget=${budget.blockedWindows.join(", ") || "frei"}, ` +
@@ -1515,15 +1517,21 @@ async function closeBrowserSafely() {
 
 // Browser-Neustart Funktion
 // forceClean=false: Session-Daten behalten (geplanter Neustart)
-// forceClean=true:  Session-Daten löschen (Fehler-Neustart)
-async function restartBrowser(forceClean = true) {
+// forceClean=true:  Session-Daten löschen (Fehler-Recovery oder frischer Login)
+async function restartBrowser(forceClean = true, options = {}) {
+    const {
+        preserveFingerprint = false,
+        notify = true,
+        logMemory = true,
+        reason = "Browser wird neu gestartet..."
+    } = options;
     if (restartPromise) {
         logger.debug("Browser-Neustart läuft bereits - warte auf denselben Vorgang");
         return restartPromise;
     }
 
     restartPromise = (async () => {
-        logger.info("Browser wird neu gestartet...");
+        logger.info(reason);
 
         try {
             const memoryBeforeRestart = getMemoryUsage();
@@ -1539,7 +1547,7 @@ async function restartBrowser(forceClean = true) {
             // Kurze Pause vor Neustart
             await delay(5000);
 
-            const success = await initializeBrowser(forceClean);
+            const success = await initializeBrowser(forceClean, { preserveFingerprint });
             if (success) {
                 lastBrowserRestart = Date.now();
                 consecutiveErrors = 0;
@@ -1557,17 +1565,19 @@ async function restartBrowser(forceClean = true) {
                 await delay(1000);
                 const memoryAfterRestart = getMemoryUsage();
                 const browserMemoryAfterRestart = getBrowserProcessMemoryUsage();
-                logger.info(
-                    `Speicher vor/nach Browser-Neustart: RSS ${memoryBeforeRestart.rss}→${memoryAfterRestart.rss}MB, ` +
-                    `Heap ${memoryBeforeRestart.heapUsed}→${memoryAfterRestart.heapUsed}MB`
-                );
-                logger.info(
-                    `Browser-Speicher vor/nach Neustart: ` +
-                    `${browserMemoryBeforeRestart.rss === null ? "unbekannt" : `${browserMemoryBeforeRestart.rss}MB`} -> ` +
-                    `${browserMemoryAfterRestart.rss === null ? "unbekannt" : `${browserMemoryAfterRestart.rss}MB`}`
-                );
+                if (logMemory) {
+                    logger.info(
+                        `Speicher vor/nach Browser-Neustart: RSS ${memoryBeforeRestart.rss}→${memoryAfterRestart.rss}MB, ` +
+                        `Heap ${memoryBeforeRestart.heapUsed}→${memoryAfterRestart.heapUsed}MB`
+                    );
+                    logger.info(
+                        `Browser-Speicher vor/nach Neustart: ` +
+                        `${browserMemoryBeforeRestart.rss === null ? "unbekannt" : `${browserMemoryBeforeRestart.rss}MB`} -> ` +
+                        `${browserMemoryAfterRestart.rss === null ? "unbekannt" : `${browserMemoryAfterRestart.rss}MB`}`
+                    );
+                }
                 logger.info("Browser erfolgreich neu gestartet");
-                sendMessage("🔄 Browser wurde neu gestartet", "info");
+                if (notify) sendMessage("🔄 Browser wurde neu gestartet", "info");
                 return true;
             }
             throw new Error("Browser-Neustart fehlgeschlagen");
@@ -1609,8 +1619,11 @@ async function restartBrowserWhenIdle(reason, forceClean = false, deferForPendin
 // Verbesserte Browser-Initialisierung
 // forceClean=true:  Session-Daten löschen → frischer Login (bei Fehlern)
 // forceClean=false: Session-Daten behalten → bestehende Session wiederverwenden
-async function initializeBrowser(forceClean = true) {
+async function initializeBrowser(forceClean = true, options = {}) {
     if (isShuttingDown) return false;
+
+    const { preserveFingerprint = false } = options;
+    restoredSessionNeedsFreshLogin = false;
 
     try {
         await closeBrowserSafely();
@@ -1618,7 +1631,7 @@ async function initializeBrowser(forceClean = true) {
         const userDataDir = path.join(scriptDirectory, "lidl-extender-data");
 
         if (forceClean) {
-            // Lösche Browser-Daten für frischen Login (nur bei Fehler-Neustarts)
+            // Lösche Browser-Daten für einen garantiert frischen Login.
             logger.info("Lösche Browser-Daten für frischen Login...");
             try {
                 if (fs.existsSync(userDataDir)) {
@@ -1636,8 +1649,14 @@ async function initializeBrowser(forceClean = true) {
             logger.info("Browser-Neustart mit bestehender Session (keine Daten gelöscht)");
         }
 
-        // Fingerprint: bei Session-Reuse gespeicherten Fingerprint verwenden (konsistente Session), sonst neu generieren
-        let fingerprint = null;
+        // Bei einem proaktiven frischen Login wird nur der Auth-/Browserzustand
+        // verworfen. Der bereits verwendete Fingerprint bleibt dabei stabil.
+        let fingerprint = preserveFingerprint && currentFingerprint
+            ? { ...currentFingerprint, locale: 'de-DE', timezoneId: 'Europe/Berlin' }
+            : null;
+        if (fingerprint) {
+            logger.info(`🎭 Browser-Fingerprint für frischen Login beibehalten: UA=${fingerprint.userAgent.substring(0, 60)}...`);
+        }
         if (!forceClean && fs.existsSync(cookiefile)) {
             try {
                 const savedData = JSON.parse(fs.readFileSync(cookiefile, 'utf-8'));
@@ -1666,6 +1685,19 @@ async function initializeBrowser(forceClean = true) {
             }
         }
         currentFingerprint = fingerprint;
+
+        if (forceClean && preserveFingerprint) {
+            fs.writeFileSync(cookiefile, JSON.stringify({
+                cookies: [],
+                origins: [],
+                _fingerprint: {
+                    userAgent: fingerprint.userAgent,
+                    viewport: fingerprint.viewport,
+                    deviceMemory: fingerprint.deviceMemory,
+                    hardwareConcurrency: fingerprint.hardwareConcurrency
+                }
+            }, null, 2));
+        }
 
         const browserOptions = {
             headless: true,
@@ -1716,7 +1748,14 @@ async function initializeBrowser(forceClean = true) {
                             const items = data[window.location.origin];
                             if (items) {
                                 for (const { name, value } of items) {
-                                    try { localStorage.setItem(name, value); } catch (_) {}
+                                    try {
+                                        // Nur den initial fehlenden Zustand ergänzen.
+                                        // Spätere, von der Lidl-App aktualisierte Werte
+                                        // dürfen bei einem Reload nicht zurückgesetzt werden.
+                                        if (localStorage.getItem(name) === null) {
+                                            localStorage.setItem(name, value);
+                                        }
+                                    } catch (_) {}
                                 }
                             }
                         }, lsData);
@@ -1732,10 +1771,19 @@ async function initializeBrowser(forceClean = true) {
                     ssCount = Object.keys(ssData).length;
                     logSessionStorageDiagnostics("wiederhergestellt", ssData);
                     if (ssCount > 0) {
+                        restoredSessionNeedsFreshLogin = true;
                         await context.addInitScript(({ origin, data }) => {
                             if (window.location.origin === origin) {
                                 for (const [key, value] of Object.entries(data)) {
-                                    try { sessionStorage.setItem(key, value); } catch (_) {}
+                                    try {
+                                        // addInitScript läuft vor jeder Navigation. Den
+                                        // Snapshot deshalb nur beim ersten, leeren Tab
+                                        // einsetzen und niemals einen live rotierten
+                                        // Access-/Refresh-Token überschreiben.
+                                        if (sessionStorage.getItem(key) === null) {
+                                            sessionStorage.setItem(key, value);
+                                        }
+                                    } catch (_) {}
                                 }
                             }
                         }, { origin: ssOrigin, data: ssData });
@@ -2055,14 +2103,20 @@ async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
                 // Zwei Slots freihalten: Login-Seite plus möglicher Formular-Submit.
                 const loginNavigationStartedAt = await reservePageRequest('login', 2);
                 if (forceFreshLogin) {
-                    // Erst nach der Request-Budget-Wartezeit löschen. So bleibt die
-                    // laufende Sitzung während einer längeren Drosselung nutzbar.
-                    await page.evaluate(() => {
-                        sessionStorage.clear();
-                        localStorage.clear();
+                    // Erst nach der Request-Budget-Wartezeit den Kontext ersetzen.
+                    // Die laufende Lidl-App konnte gelöschten Web Storage aus ihrem
+                    // Arbeitsspeicher wiederherstellen; ein frisches Profil verhindert
+                    // zuverlässig, dass der alte Token erneut übernommen wird.
+                    const freshContextStarted = await restartBrowser(true, {
+                        preserveFingerprint: true,
+                        notify: false,
+                        logMemory: false,
+                        reason: "Browserkontext wird für proaktive Neuanmeldung frisch aufgebaut..."
                     });
-                    await context.clearCookies();
-                    logger.info("Lokale Browser-Anmeldung für proaktiven frischen Login entfernt");
+                    if (!freshContextStarted) {
+                        throw new Error("Frischer Browserkontext für Token-Preflight konnte nicht gestartet werden");
+                    }
+                    logger.info("Frischer Browserkontext für proaktive Neuanmeldung bereit");
                 }
                 resetPageErrors();
                 resetNavigationDiagnostics();
@@ -2093,6 +2147,7 @@ async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
                 logger.info(`Session noch gültig (kein Login-Formular) - URL: ${page.url()}`);
                 overviewFreshFromLogin = page.url().startsWith(uebersichtUrl);
                 if (forceFreshLogin) {
+                    restoredSessionNeedsFreshLogin = false;
                     await persistCurrentBrowserSession("nach proaktiver Neuanmeldung");
                 }
                 loginAttempts = 0;
@@ -2105,8 +2160,12 @@ async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
             // sich später zwischen normaler Session-Ablaufzeit und Tokenfehler
             // unterscheiden.
             if (hatLoginFormularNachGoto) {
+                const sessionRefreshFailed = hasSessionRefreshError();
                 await logAuthFailureDiagnostics(
-                    hasSessionRefreshError() ? "Session-Erneuerung" : "Login-Formular erkannt"
+                    sessionRefreshFailed
+                        ? "Session-Erneuerung"
+                        : (forceFreshLogin ? "Proaktiver frischer Login" : "Login-Formular erkannt"),
+                    sessionRefreshFailed || lastPageErrors.length > 0 ? "warn" : "info"
                 );
             }
             if (hasSessionRefreshError() && !authRecoveryNoticeActive) {
@@ -2183,6 +2242,28 @@ async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
                 }
             }
 
+            if (forceFreshLogin) {
+                const refreshedSession = await getLiveSessionStorageSnapshot();
+                const refreshedExpiresAt = refreshedSession?.diagnostics?.expiresAt || 0;
+                const refreshedExpiresInSeconds = refreshedExpiresAt > 0
+                    ? Math.floor((refreshedExpiresAt - Date.now()) / 1000)
+                    : null;
+                if (
+                    refreshedExpiresInSeconds !== null &&
+                    refreshedExpiresInSeconds <= TOKEN_PREFLIGHT_SECONDS
+                ) {
+                    throw new Error(
+                        `Proaktive Neuanmeldung lieferte keinen ausreichend frischen Token ` +
+                        `(${refreshedExpiresInSeconds}s Restlaufzeit)`
+                    );
+                }
+                logger.info(
+                    refreshedExpiresInSeconds === null
+                        ? "Proaktive Neuanmeldung abgeschlossen; Token-Ablaufzeit nicht auslesbar"
+                        : `Proaktive Neuanmeldung bestätigt: neuer Token mit ${refreshedExpiresInSeconds}s Restlaufzeit`
+                );
+            }
+
             await persistCurrentBrowserSession("nach Login");
 
             lastActivityTime = Date.now();
@@ -2190,6 +2271,7 @@ async function performLogin(recoveryAttempt = 0, forceFreshLogin = false) {
             loginAttempts = 0;
             consecutiveErrors = 0;
             authRecoveryNoticeActive = false;
+            restoredSessionNeedsFreshLogin = false;
 
             logger.info("Login erfolgreich, Session-Daten gespeichert");
             return true;
@@ -2281,15 +2363,19 @@ async function main() {
                     ? Math.floor((expiresAt - Date.now()) / 1000)
                     : null;
                 if (
+                    restoredSessionNeedsFreshLogin &&
                     expiresInSeconds !== null &&
                     expiresInSeconds <= TOKEN_PREFLIGHT_SECONDS &&
-                    Date.now() - lastTokenPreflightAt >= TOKEN_PREFLIGHT_COOLDOWN_MS
+                    (
+                        Date.now() - lastTokenPreflightAt >= TOKEN_PREFLIGHT_COOLDOWN_MS ||
+                        expiresInSeconds <= 60
+                    )
                 ) {
                     const budget = getRequestBudgetState(Date.now(), 2);
                     forceFreshLogin = true;
                     lastTokenPreflightAt = Date.now();
                     logger.info(
-                        `Token-Preflight: Ablauf in ${expiresInSeconds}s, ` +
+                        `Token-Preflight für wiederhergestellte Session: Ablauf in ${expiresInSeconds}s, ` +
                         `Request-Budget-Wartezeit aktuell ${Math.ceil(budget.delayMs / 1000)}s`
                     );
                     saveSessionMeta();
@@ -3066,7 +3152,8 @@ async function start() {
         `Request-Budget: ${RATE_LIMIT_WINDOWS.map(window => `${window.maxRequests}/${window.label}`).join(", ")}`
     );
     logger.info(
-        `Session-Schutz: Token-Preflight ${TOKEN_PREFLIGHT_SECONDS}s vor Ablauf, ` +
+        `Session-Schutz: einmaliger Preflight für wiederhergestellte Session ` +
+        `${TOKEN_PREFLIGHT_SECONDS}s vor Ablauf, ` +
         `Cooldown ${Math.round(TOKEN_PREFLIGHT_COOLDOWN_MS / 60000)}min; ` +
         `Wartungs-Backoff ${MAINTENANCE_BACKOFF_MINUTES}min`
     );
