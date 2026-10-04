@@ -1,136 +1,90 @@
-# Lidl Connect Datenverbrauchs-Benachrichtigung 📱
+# Lidl Connect Extender
 
-Ein Skript, das sich automatisch in dein **Lidl-Connect-Konto** einloggt, deinen Datenverbrauch abruft und Benachrichtigungen über **Telegram** und/oder **Discord** sendet.  
-So gehst du nie wieder unerwartet ohne Datenvolumen aus!  
-Dieses Projekt löst das Problem, den Datenverbrauch manuell überprüfen zu müssen, indem es den gesamten Prozess automatisiert und dich proaktiv über dein verbleibendes Datenvolumen informiert.
+Diese Version erweitert die bestehende Lidl-Connect-Implementierung um eine frühere und zuverlässigere Nachbuchung, adaptive Prüfintervalle und eine robustere Verarbeitung der Daten aus dem Lidl-Dashboard.
 
----
+Der Schwerpunkt liegt auf Problemen und Verbesserungsmöglichkeiten, die bei der praktischen Nutzung aufgefallen sind.
 
-## 🔍 Hinweis
+## 🔧 Wichtigste Änderungen
 
-Dieses Skript dient ausschließlich zu Demonstrationszwecken. Auch wenn die Nutzung von Skripten oder Bots zur Automatisierung technisch möglich und nachvollziehbar erscheint, ist deren Einsatz laut den Richtlinien der Firma strengstens untersagt. Verstöße gegen diese Regelung insbesondere automatisierte Abläufe können zu einem sofortigen Ausschluss bzw. zur Kündigung führen.
+### 🔄 Verbesserte Nachbuchungslogik
 
----
+Die Nachbuchung wurde von der bisherigen **1-GB-Grenze** auf eine **80-%-Verbrauchsschwelle** umgestellt.
 
-## 🚀 Funktionen
+Statt erst zu reagieren, wenn weniger als 1 GB verfügbar sind, wird jetzt bei 80 % Verbrauch nachgebucht. Dadurch bleiben im Normalbetrieb etwa **20 % des ursprünglichen Tarifvolumens als Datenpuffer** erhalten.
 
-- **Automatische Anmeldung:** Meldet sich mit Playwright bei deinem Lidl-Connect-Konto an.
-- **Datenabruf:** Liest das verbleibende Datenvolumen und die Gültigkeitsdauer aus.
-- **Benachrichtigungssystem:** Sendet personalisierte Benachrichtigungen über Telegram und/oder Discord.
-- **Automatische Updates:** Prüft optional auf Updates und aktualisiert sich von GitHub.
-- **Konfigurierbar:** Verwendung von `.env`-Dateien zur einfachen Einstellung von Zugangsdaten, Benachrichtigungen und Update-Optionen.
-- **Periodische Überprüfung:** Führt in festgelegten Intervallen Prüfungen durch.
-- **Fehlerbehandlung:** Robuste Erkennung und Protokollierung von Fehlern.
+Der Fortschritt bis zur 80-%-Schwelle wird zusätzlich angezeigt, sodass jederzeit erkennbar ist, wie weit der Verbrauch fortgeschritten ist.
 
----
+### 📊 Adaptive Prüfintervalle
 
-## 🛠️ Technischer Stack
+Die Prüfintervalle werden dynamisch anhand des verfügbaren Datenvolumens, des aktuellen Verbrauchs und der konfigurierten Internetgeschwindigkeit berechnet.
 
-- **Browser-Automatisierung:** `playwright`
-- **HTTP-Anfragen:** `axios`
-- **Umgebungsvariablen:** `dotenv`
-- **Dateisystem-Operationen:** `fs`
-- **Prozessverwaltung:** `child_process`
-- **Protokollierung:** `logging`
-- **JavaScript:** Kernsprache
-- **Node.js:** Laufzeitumgebung
+Die Internetgeschwindigkeit wird über `.env` konfiguriert:
 
----
-
-## 📦 Installation
-
-### Voraussetzungen
-
-- **Node.js** (Version 16 oder höher)
-- **npm** (wird mit Node installiert)
-- Ein **Lidl-Connect-Konto**
-- (Optional) Ein **Telegram-Bot** und/oder ein **Discord-Webhook**
-
----
-
-### Installation
-
-1. Repository klonen:
-
-    ```bash
-    git clone https://github.com/user871258938/lidl
-    cd lidl
-    ```
-
-2. Abhängigkeiten installieren:
-
-    ```bash
-    npm install
-    ```
-
-3. Playwright installieren:
-
-    ```bash
-    npx playwright install
-    ```
-
-4. Beispiel-Umgebungsdatei kopieren:
-
-    ```bash
-    cp .env.example .env
-    ```
-
-5. `.env` bearbeiten und deine Zugangsdaten eintragen:
-
----
-
-## 💻 Nutzung
-
-Skript starten:
-
-```bash
-node script.js
-```
-Das Skript meldet sich automatisch bei deinem Lidl-Connect-Konto an, ruft die aktuellen Verbrauchsdaten ab und sendet Benachrichtigungen entsprechend deiner Konfiguration.
-Es pausiert danach für die eingestellte Zeit und wiederholt den Vorgang.
-
-Für eine längere Nutzung empfiehlt sich ein Tool wie nohup oder Docker
-
-```bash
-nohup node script.js &
+```env
+INTERNET_SPEED_MBPS=500
 ```
 
-```bash
-docker build -t lidl-extender . && docker run -d --name lidl-extender --hostname lidl-extender --restart unless-stopped lidl-extender
+`500` entspricht **500 Mbps** und dient als Standardwert.
+
+Mit zunehmendem Verbrauch werden die Prüfungen automatisch häufiger. Kurz vor Erreichen der 80-%-Schwelle kann das Intervall bis auf **30 Sekunden** reduziert werden, damit die Nachbuchung zeitnah erkannt und ausgelöst werden kann.
+
+Zusätzlich wird auf jedes berechnete Prüfintervall ein **Jitter von 0–50 %** angewendet. Die tatsächliche Wartezeit liegt dadurch zufällig zwischen dem berechneten Intervall und bis zu 50 % darüber. Ein berechnetes Intervall von 30 Sekunden führt beispielsweise zu einer zufälligen Wartezeit von 30 bis 45 Sekunden.
+
+Dadurch entstehen keine starren, exakt wiederkehrenden Prüfzeitpunkte, während die berechnete Mindestwartezeit erhalten bleibt.
+
+### 🔔 Benachrichtigungen
+
+Status- und Erfolgsmeldungen wurden erweitert und zeigen den aktuellen Verbrauch sowie den Fortschritt bis zur Nachbuchung direkt an.
+
+Beispiel:
+
+```text
+📡 Lidl-Extender
+
+⏳ WAITING FOR 80%
+
+used 18.2/26.0 GB (70%)
+[██████████████████░░]
+88% of 80% used · to 80%: 2.6 GB
 ```
 
----
+Bei erreichter Schwelle:
 
-📂 Projektstruktur
+```text
+📡 Lidl-Extender
 
-├── .env.example          # Beispiel für die Umgebungsvariablen
-├── .env                  # Persönliche Zugangsdaten (nicht hochladen!)
-├── script.js             # Hauptskript
-├── package.json          # Abhängigkeiten und Metadaten
-├── package-lock.json     # Abhängigkeitsversionen
-└── README.md             # Projektdokumentation
+🔄 RECHARGING NOW
 
+used 20.8/26.0 GB (80%)
+[████████████████████]
+100% of 80% used
+```
 
----
+### 🔎 Verbesserte Datenerkennung
 
-🤝 Mitwirken
+Die Auswertung der Verbrauchs- und Refill-Daten wurde von einzelnen festen HTML-Elementen entkoppelt.
 
-Beiträge sind willkommen!
-Pull-Requests mit Bugfixes, neuen Funktionen oder Verbesserungen der Dokumentation sind gern gesehen.
+Das Skript erkennt nun mehrere mögliche Strukturen des Lidl-Dashboards, darunter sowohl die bisherigen Datenfelder als auch neuere Elemente wie `progress-DATA-*` und `progress-REFILL`. Falls sich die Positionen oder IDs der Elemente ändern, steht zusätzlich eine positionsbasierte Erkennung innerhalb der Verbrauchsanzeige zur Verfügung.
 
----
+Dadurch können Änderungen an der Darstellung des Lidl-Dashboards verarbeitet werden, ohne dass die Datenauswertung vollständig von einem bestimmten Selector abhängt.
 
-📝 Lizenz
+### 🐛 Fehlerbehebungen und Stabilitätsverbesserungen
 
-Dieses Projekt steht unter der GNU General Public License v3.0.
-Details siehe [License](LICENSE).
+Unter anderem wurden folgende Punkte angepasst:
 
----
+* zuverlässigere Verarbeitung des Refill-Volumens
+* korrigierte Verarbeitung der Datenwerte nach einer Nachbuchung
+* funktionierender Cool-down nach fehlgeschlagenen Nachbuchungsversuchen
+* zuverlässigeres Login- und Navigationsverhalten
+* bessere Verarbeitung veränderter Dashboard-Strukturen
+* zusätzliche Fehler- und Randfallbehandlung
 
-💖 Dankesnachricht
+## 🎯 Ziel
 
-Danke, dass du dir dieses Projekt angesehen hast!
-Ich hoffe, es hilft dir, deinen Datenverbrauch immer im Blick zu behalten.
+Ziel der Änderungen ist es, die bestehende Implementierung stärker an den tatsächlichen Laufzeitdaten auszurichten und die Abhängigkeit von festen Zeitintervallen und einzelnen DOM-Strukturen zu reduzieren.
 
-Das README wurde mit [readme.ai](https://readme-generator-phi.vercel.app/) erstellt und mit ChatGPT übersetzt.
-Vielen Dank auch an @Downwind_Lee von Telegram, für eine verbesserte Version des Scripts.
+Die Änderungen können vollständig übernommen oder je nach Bedarf auch einzeln betrachtet und übernommen werden.
+
+## Version
+
+**1.2.5**

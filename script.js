@@ -3,7 +3,8 @@ import * as playwright from "playwright";
 import axios from "axios";
 
 import dotenv from "dotenv";
-dotenv.config({ path: new URL('./.env', import.meta.url).pathname });
+import { fileURLToPath } from "url";
+dotenv.config({ path: fileURLToPath(new URL('./.env', import.meta.url)) });
 // .env geladen?
 if (!process.env.RUFNUMMER || !process.env.PASSWORD) {
     throw new Error("ENV Fehler: RUFNUMMER oder PASSWORD fehlt oder ist leer");
@@ -28,6 +29,8 @@ const killExistingProcesses = process.env.KILL_EXISTING_PROCESSES === "true";
 const killScriptInstances = process.env.KILL_SCRIPT_INSTANCES === "true";
 const sleepmode = process.env.SLEEP_MODE;
 const sleepTime = parseInt(process.env.SLEEP_TIME, 10);
+const SPEED_PLACEHOLDER_MBPS = 500;
+const INTERNET_SPEED_MBPS = Math.max(1, parseInt(process.env.INTERNET_SPEED_MBPS, 10) || SPEED_PLACEHOLDER_MBPS);
 const infoLevel = process.env.INFO_LEVEL || "info";
 
 // URLs
@@ -90,7 +93,10 @@ function generateFingerprint() {
 // Verbesserte Konstanten für Stabilität
 const MAX_LOGIN_ATTEMPTS = 3;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const SESSION_KEEPALIVE_INTERVAL = 2 * 60 * 1000; // 2 Minuten (häufiger)
+const KEEPALIVE_NORMAL_MS = 2 * 60 * 1000; // Default, falls Daten unbekannt
+const KEEPALIVE_BASE_PER_GB = KEEPALIVE_NORMAL_MS / 25; // Basis: 2 Min. je 25 GB
+const KEEPALIVE_MAX_BASE_MS = 30 * 60 * 1000; // Basis-Cap: 30 Min.
+const KEEPALIVE_MIN_MS = 30 * 1000; // kürtester Wartezeit
 const SESSION_TIMEOUT = 25 * 60 * 1000; // 25 Minuten (kürzer)
 const BROWSER_RESTART_INTERVAL = 2 * 60 * 60 * 1000; // 2 Stunden
 const MEMORY_CHECK_INTERVAL = 10 * 60 * 1000; // 10 Minuten
@@ -110,6 +116,8 @@ let lastBrowserRestart = Date.now();
 
 // Watchdog-Variablen für Deadlock-Erkennung
 let watchdogTimer = null;
+let heartbeatTimer = null; // Keep-Alive-Heartbeat über lange Schlafphasen
+let isRestarting = false; // Guard: kein zweiter Restart, während einer läuft
 let lastHeartbeat = Date.now();
 let highCpuCounter = 0;
 let lastCpuUsage = process.cpuUsage();
@@ -122,6 +130,45 @@ const HIGH_CPU_DURATION = 30000; // 30 Sekunden
 // NaN-Fehlertracking
 let nanErrorCount = 0;
 const MAX_NAN_ERRORS = 3;
+
+// Refill-Nachbuchung: Lidl-Connect erlaubt das Nachfüllen (+1 GB)
+// erst ab 80% Verbrauch des Gesamtvolumens
+const REFILL_USAGE_THRESHOLD = 0.8;
+const REFILL_RETRY_COOLDOWN_MS = 10 * 60 * 1000; // 10 Minuten Cooldown nach Fehlversuch
+let refillFailedAt = 0;
+let lastKnownConsumptionPct = NaN; // letzter bekannter Verbrauch (0-1)
+let lastKnownTotalGB = NaN; // letzter bekannter Gesamtvolumen in GB
+
+function shouldWaitRefillCooldown() {
+    return refillFailedAt > 0 && Date.now() - refillFailedAt < REFILL_RETRY_COOLDOWN_MS;
+}
+
+// 80%-Refill-Schwelle: Bar, consumed, distance to 80% – jede Info eigene Zeile
+function buildRefillProgressLine(usage) {
+    const totalVolume =
+        (isNaN(usage.tarif.total) ? 0 : usage.tarif.total) +
+        (isNaN(usage.refill.total) ? 0 : usage.refill.total);
+    const consumed =
+        (isNaN(usage.tarif.total) || isNaN(usage.tarif.available) ? 0 : Math.max(0, usage.tarif.total - usage.tarif.available)) +
+        (isNaN(usage.refill.total) || isNaN(usage.refill.available) ? 0 : Math.max(0, usage.refill.total - usage.refill.available));
+
+    if (totalVolume <= 0) {
+        return `📊 80% bar: data unavailable`;
+    }
+
+    const thresholdPct = REFILL_USAGE_THRESHOLD * 100;
+    const consumedPct = (consumed / totalVolume) * 100;
+    const progress80 = Math.min(1, consumedPct / thresholdPct);
+    const barLen = 20;
+    const filled = Math.round(progress80 * barLen);
+    const bar = `[${"█".repeat(filled)}${"░".repeat(barLen - filled)}]`;
+    const toThresholdGb = Math.max(0, totalVolume * REFILL_USAGE_THRESHOLD - consumed);
+
+    if (consumedPct >= thresholdPct) {
+        return `🔄 RECHARGING NOW\nused ${consumed.toFixed(1)}/${totalVolume.toFixed(1)} GB (${consumedPct.toFixed(0)}%)\n${bar}\n100% of 80% used`;
+    }
+    return `⏳ WAITING FOR 80%\nused ${consumed.toFixed(1)}/${totalVolume.toFixed(1)} GB (${consumedPct.toFixed(0)}%)\n${bar}\n${(progress80 * 100).toFixed(0)}% of 80% used · to 80%: ${toThresholdGb.toFixed(1)} GB`;
+}
 
 // Circuit Breaker Pattern
 class CircuitBreaker {
@@ -183,6 +230,16 @@ function updateHeartbeat() {
     lastHeartbeat = Date.now();
 }
 
+// Menschlich lesbare Dauer für User-Meldungen (Minuten/Std., keine rohen Sekunden/ms)
+function formatDuration(ms) {
+    const totalMinutes = Math.max(1, Math.round(ms / 60000));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours > 0 && minutes > 0) return `${hours} Std. ${minutes} Min.`;
+    if (hours > 0) return `${hours} Std.`;
+    return `${minutes} Min.`;
+}
+
 // Watchdog-Funktion zur Deadlock-Erkennung
 function startWatchdog() {
     if (watchdogTimer) clearInterval(watchdogTimer);
@@ -208,17 +265,20 @@ function startWatchdog() {
         lastCpuCheck = now;
 
         // Deadlock-Erkennung: Kein Heartbeat für zu lange
-        if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT) {
+        if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT && !isRestarting) {
             logger.error(`🚨 WATCHDOG: Deadlock erkannt! Kein Heartbeat seit ${timeSinceLastHeartbeat}ms - Versuche Browser-Restart`);
-            sendMessage(`🚨 WATCHDOG: Script scheint zu hängen (${timeSinceLastHeartbeat}ms kein Heartbeat) - Versuche Restart`, "warn");
+            sendMessage(`🚨 WATCHDOG: Script scheint zu hängen (${formatDuration(timeSinceLastHeartbeat)} kein Heartbeat) - Versuche Restart`, "warn");
             
+            isRestarting = true;
+            updateHeartbeat(); // Restart läuft - Watchdog darf nicht erneut auslösen
             try {
                 await restartBrowser();
                 logger.info("Browser nach Deadlock erfolgreich neu gestartet");
-                return; // Fortfahren mit nächstem Check
             } catch (restartError) {
                 logger.error(`Browser-Restart nach Deadlock fehlgeschlagen: ${restartError.message} - Erzwinge Shutdown`);
                 gracefulShutdown('WATCHDOG_DEADLOCK_RESTART_FAILED');
+            } finally {
+                isRestarting = false;
             }
             return;
         }
@@ -228,11 +288,19 @@ function startWatchdog() {
             highCpuCounter++;
             logger.warn(`⚠️ WATCHDOG: Hohe CPU-Auslastung erkannt (${Math.round(cpuPercent)}%) [${highCpuCounter}x]`);
 
-            if (highCpuCounter * WATCHDOG_INTERVAL > HIGH_CPU_DURATION) {
+            if (highCpuCounter * WATCHDOG_INTERVAL > HIGH_CPU_DURATION && !isRestarting) {
                 logger.error(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU für ${(highCpuCounter * WATCHDOG_INTERVAL / 1000).toFixed(1)}s - Erzwinge Restart`);
                 sendMessage(`🚨 WATCHDOG: Script verbraucht ${Math.round(cpuPercent)}% CPU - Browser wird neu gestartet`, "warn");
                 highCpuCounter = 0;
-                await restartBrowser();
+                isRestarting = true;
+                updateHeartbeat(); // Restart läuft - Watchdog darf nicht erneut auslösen
+                try {
+                    await restartBrowser();
+                } catch (cpuRestartError) {
+                    logger.error(`Browser-Restart nach CPU-Alarm fehlgeschlagen: ${cpuRestartError.message}`);
+                } finally {
+                    isRestarting = false;
+                }
             }
         } else {
             highCpuCounter = 0; // Reset bei normaler CPU
@@ -527,6 +595,35 @@ async function keepSessionAlive() {
     }
 }
 
+// Keep-Alive-Intervall: Basis skaliert mit dem Gesamtvolumen und schrumpft
+// linear zu 30s je näher der Verbrauch an die 80%-Schwelle kommt. Immer
+// randomisiert (keine festen Ticks).
+// Jitter: +0 % bis +50 % zufällig — nur additiv, nie subtraktiv
+function jitterMs(ms) {
+    return ms + getRandomInteger(0, Math.floor(ms * 0.5));
+}
+
+function getKeepAliveInterval() {
+    if (isNaN(lastKnownConsumptionPct) || isNaN(lastKnownTotalGB) || lastKnownTotalGB <= 0) {
+        return jitterMs(KEEPALIVE_NORMAL_MS);
+    }
+    // Basis: 2 Min. je 25 GB des Plans
+    const base = Math.min(KEEPALIVE_MAX_BASE_MS, Math.max(KEEPALIVE_MIN_MS, KEEPALIVE_BASE_PER_GB * lastKnownTotalGB));
+    // 0% verbraucht -> Basis, 80%+ -> 30s (linear dazwischen)
+    const progress = Math.max(0, Math.min(1, lastKnownConsumptionPct / REFILL_USAGE_THRESHOLD));
+    const interval = KEEPALIVE_MIN_MS + (1 - progress) * (base - KEEPALIVE_MIN_MS);
+    return jitterMs(interval);
+}
+
+// Rekusiver Keep-Alive-Loop: Intervall wird bei jedem Durchlauf neu berechnet
+async function runKeepAliveLoop() {
+    if (isShuttingDown || !page || page.isClosed()) return;
+    await keepSessionAlive();
+    if (!isShuttingDown) {
+        keepAliveTimer = setTimeout(runKeepAliveLoop, getKeepAliveInterval());
+    }
+}
+
 // Sicheres Browser-Schließen
 async function closeBrowserSafely() {
     try {
@@ -551,6 +648,7 @@ async function closeBrowserSafely() {
 // Browser-Neustart Funktion
 async function restartBrowser() {
     logger.info("Browser wird neu gestartet...");
+    updateHeartbeat(); // Restart läuft - Watchdog nicht verhungern lassen
 
     try {
         await closeBrowserSafely();
@@ -606,7 +704,9 @@ async function initializeBrowser() {
         logger.info(`🎭 Neue Browser-Fingerprint: UA=${fingerprint.userAgent.substring(0, 60)}..., Viewport=${fingerprint.viewport.width}x${fingerprint.viewport.height}, Memory=${fingerprint.deviceMemory}GB, Cores=${fingerprint.hardwareConcurrency}`);
 
         const browserOptions = {
-            headless: true,
+            // HEADLESS=false env var forces a visible browser window
+            headless: process.env.HEADLESS !== "false",
+
             args: [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -707,7 +807,7 @@ async function performLogin() {
             // Login-Button klicken und auf Navigation warten
             await Promise.all([
                 page.click('button[type="submit"]:has-text("Einloggen")'),
-                page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 })
+                page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 })
             ]);
 
             await delay(3000);
@@ -749,6 +849,60 @@ async function performLogin() {
 }
 
 // Verbesserte Hauptfunktion mit Circuit Breaker
+// Robustes Auslesen von Tarif- und Refill-Volumen aus dem aktuellen Lidl-DOM.
+// Die for-Attribute der unit-display-Labels sind seit app-consumptions-v2
+// z. B. "progress-DATA-0" (früher exakt "DATA" / "REFILLABLE_DATA").
+// Fallback: positionale Zuordnung innerhalb von .app-consumption-list.
+async function readConsumptionUsage(page) {
+    return page.evaluate(() => {
+        const parseLabel = (el) => {
+            const text = el ? el.textContent.trim() : '';
+            const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+            const unitEl = el ? el.querySelector('span.unit') : null;
+            return {
+                available: nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN,
+                total: nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN,
+                unit: unitEl ? unitEl.textContent.trim() : ''
+            };
+        };
+
+        const findLabel = (selectors) => {
+            for (const sel of selectors) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim().length > 0) return el;
+                } catch (e) { }
+            }
+            return null;
+        };
+
+        const consumptionList = document.querySelector('.app-consumption-list');
+        const allLabels = consumptionList
+            ? Array.from(consumptionList.querySelectorAll('label.unit-display'))
+            : Array.from(document.querySelectorAll('label.unit-display'));
+
+        // Tarif
+        let tarifLabel = findLabel([
+            'label[for="DATA"].unit-display',
+            'label[for^="progress-DATA"].unit-display',
+        ]);
+        if (!tarifLabel && allLabels.length > 0) tarifLabel = allLabels[0];
+
+        // Refill (optional, kann fehlen)
+        let refillLabel = findLabel([
+            'label[for="REFILLABLE_DATA"].unit-display',
+            'label[for^="progress-REFILL"].unit-display',
+        ]);
+        if (!refillLabel && allLabels.length > 1) refillLabel = allLabels[1];
+        if (refillLabel === tarifLabel) refillLabel = null;
+
+        return {
+            tarif: tarifLabel ? parseLabel(tarifLabel) : { available: NaN, total: NaN, unit: '' },
+            refill: refillLabel ? parseLabel(refillLabel) : { available: NaN, total: NaN, unit: '' }
+        };
+    });
+}
+
 async function main() {
     if (isShuttingDown) return 0;
 
@@ -780,8 +934,8 @@ async function main() {
             // Warte auf Datenvolumen-Element bevor wir extrahieren
             try {
                 await page.waitForFunction(() => {
-                    const element = document.querySelector('label[for="DATA"].unit-display');
-                    return element && element.textContent.trim().length > 0;
+                    const labels = document.querySelectorAll('.app-consumption-list label.unit-display');
+                    return Array.from(labels).some(el => el && el.textContent.trim().length > 0);
                 }, { timeout: 15000 });
                 logger.debug("Datenvolumen-Element gefunden und bereit");
             } catch (error) {
@@ -791,37 +945,14 @@ async function main() {
             await delay(1000); // Zusätzliche kurze Wartezeit
 
 			// Datenvolumen auslesen (Tarif + Refill)
-			const usage = await page.evaluate(() => {
-				const result = {
-					tarif: { available: NaN, total: NaN, unit: '' },
-					refill: { available: NaN, total: NaN, unit: '' }
-				};
+			const usage = await readConsumptionUsage(page);
 
-				// Get Tarif data (DATA id)
-				const tarifLabel = document.querySelector('label[for="DATA"].unit-display');
-				if (tarifLabel) {
-					const text = tarifLabel.textContent.trim();
-					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.tarif.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.tarif.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = tarifLabel.querySelector('span.unit');
-					result.tarif.unit = unitEl ? unitEl.textContent.trim() : '';
-				}
+			// Last known Verbrauch (für adaptives Keep-Alive + Refill-Gate)
+			if (!isNaN(usage.tarif.total) && usage.tarif.total > 0 && !isNaN(usage.tarif.available)) {
+				lastKnownConsumptionPct = (usage.tarif.total - usage.tarif.available) / usage.tarif.total;
+				lastKnownTotalGB = usage.tarif.total;
+			}
 
-				// Get Refill data (REFILLABLE_DATA id) - optional, may not always be present
-				const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-				if (refillLabel) {
-					const text = refillLabel.textContent.trim();
-					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.refill.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.refill.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = refillLabel.querySelector('span.unit');
-					result.refill.unit = unitEl ? unitEl.textContent.trim() : '';
-				}
-
-				return result;
-			});
-			
 			let datenVerfuegbar = usage.tarif.available;
 			let refillVerfuegbar = usage.refill.available;
 
@@ -847,6 +978,10 @@ async function main() {
 			// Bei erfolgreicher Extraktion: NaN-Fehler zurücksetzen
 			resetNanErrors();
 
+			// Fortschritt zur 80%-Refill-Schwelle in den Output-Log schreiben
+			const refillProgressLine = buildRefillProgressLine(usage);
+			logger.info(refillProgressLine);
+
 			// Log both volumes
 			const tarifMessage = `📊 Tarif: ${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
 			let refillMessage = '';
@@ -859,11 +994,14 @@ async function main() {
 			
 			logger.info(tarifMessage);
 
-            // Nachbuchung falls nötig (unter 0.8 GB vom Refill Volumen)
+            // Nachbuchung: Trigger, sobald der Verbrauch die 80%-Schwelle des Gesamtvolumens erreicht
+            const usageAtThreshold = !isNaN(datenVerfuegbar) && lastKnownConsumptionPct >= REFILL_USAGE_THRESHOLD;
+            const refillHasRoom = !isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8;
             let nachbuchungsErfolg = false;
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8)) {
+            let statusMessage = null;
+            if (usageAtThreshold && refillHasRoom && !shouldWaitRefillCooldown()) {
                 try {
-                    logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
+                    logger.info("80%-Schwelle erreicht, versuche Refill zu aktivieren...");
                     const refillVorher = refillVerfuegbar;
                     
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
@@ -873,21 +1011,9 @@ async function main() {
                     await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
                     await delay(2000);
                     
-                    const usageNach = await page.evaluate(() => {
-                        const result = { available: NaN, total: NaN, unit: '' };
-                        const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-                        if (refillLabel) {
-                            const text = refillLabel.textContent.trim();
-                            const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-                            result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-                            result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-                            const unitEl = refillLabel.querySelector('span.unit');
-                            result.unit = unitEl ? unitEl.textContent.trim() : '';
-                        }
-                        return result;
-                    });
+                    const usageNach = await readConsumptionUsage(page);
                     
-                    const refillNachher = usageNach.available;
+                    const refillNachher = usageNach.refill.available;
                     
                     // Prüfe ob Refill sich erhöht hat
                     if (!isNaN(refillNachher) && refillNachher > refillVorher) {
@@ -897,36 +1023,39 @@ async function main() {
                         // Aktualisiere refillVerfuegbar mit neuem Wert für korrekte Berechnung
                         refillVerfuegbar = refillNachher;
                         
-                        // Erfolgs-Nachricht sofort senden
-                        let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
+                        // Erfolgs-Nachricht aufbewahren (wird in der Hauptschleife zusammengefasst gesendet)
+                        let successMessage = `📡 Lidl-Extender\n✅ Refill erfolgreich aktiviert!\n`;
                         successMessage += `📊 Tarif: ${datenVerfuegbar} GB / 25 GB\n`;
                         successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
-                        sendMessage(successMessage, "info");
+                        successMessage += `\n${refillProgressLine}`;
+                        statusMessage = successMessage;
                     } else {
                         logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
                     }
                 } catch (e) {
+                    refillFailedAt = Date.now(); // Cooldown für den nächsten Versuch
                     logger.error(`Fehler beim Nachbuchungsversuch: ${e.message}`);
                     sendMessage(`❌ Refill-Aktivierung fehlgeschlagen: ${e.message}`, "error");
                 }
             }
 
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
-            datenVolumen = datenVerfuegbar + refillVerfuegbar;
+            datenVolumen = isNaN(refillVerfuegbar) ? datenVerfuegbar : datenVerfuegbar + refillVerfuegbar;
             lastActivityTime = Date.now();
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
 
-                // Send status update with volumes (nur wenn kein Refill durchgeführt wurde)
+                // Status-Nachricht aufbauen (wird in der Hauptschleife mit Verfügbarkeits-/Prüfungszeile zusammengefasst gesendet)
                 if (!nachbuchungsErfolg) {
-                    let finalStatusMessage = tarifMessage;
+                    let finalStatusMessage = "📡 Lidl-Extender\n" + tarifMessage;
                     if (!isNaN(refillVerfuegbar)) {
                         finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
                     }
-                    sendMessage(finalStatusMessage, "info");
+                    finalStatusMessage += "\n" + refillProgressLine;
+                    statusMessage = finalStatusMessage;
                 }
 
-            return datenVolumen;
+            return { volumen: datenVolumen, message: statusMessage };
         });
 
     } catch (error) {
@@ -1059,17 +1188,33 @@ function getInterval(daten) {
     return getRandomInteger(300, 500);
 }
 
+// Adaptive Check-Intervall: skaliert nach Datenvolumen UND Internet-Geschwindigkeit (Mbps).
+// Schnelleres Netz -> kürzere Wartezeiten. Platzhalter 500 Mbps, falls nicht gesetzt.
+const SPEED_BASE_MBPS = 500;
+const SPEED_FACTOR_MIN = 0.5;
+const SPEED_FACTOR_MAX = 3.0;
+
+function speedFactor() {
+    const f = SPEED_BASE_MBPS / INTERNET_SPEED_MBPS;
+    return Math.max(SPEED_FACTOR_MIN, Math.min(SPEED_FACTOR_MAX, f));
+}
+
+function scaledInterval(min, max) {
+    const f = speedFactor();
+    return getRandomInteger(Math.round(min * f), Math.round(max * f));
+}
+
 function getSmartInterval(Datenvolumen) {
     if (Datenvolumen >= 10) {
-        return getRandomInteger(3600, 5400);
+        return scaledInterval(900, 1800);
     } else if (Datenvolumen >= 5) {
-        return getRandomInteger(900, 1800);
+        return scaledInterval(600, 900);
     } else if (Datenvolumen >= 3) {
-        return getRandomInteger(600, 900);
+        return scaledInterval(300, 450);
     } else if (Datenvolumen >= 2) {
-        return getRandomInteger(300, 450);
+        return scaledInterval(150, 240);
     } else if (Datenvolumen >= 1.2) {
-        return getRandomInteger(150, 240);
+        return scaledInterval(90, 150);
     } else if (Datenvolumen >= 1.0) {
         return getRandomInteger(60, 90);
     } else {
@@ -1079,15 +1224,21 @@ function getSmartInterval(Datenvolumen) {
 
 // Timer-Management
 function startTimers() {
-    // Keep-Alive Timer
+    // Keep-Alive Timer (adaptiv: skaliert nach Gesamtvolumen, randomisiert)
     if (keepAliveTimer) {
-        clearInterval(keepAliveTimer);
+        clearTimeout(keepAliveTimer);
     }
-    keepAliveTimer = setInterval(async () => {
-        if (!isShuttingDown && page && !page.isClosed()) {
-            await keepSessionAlive();
-        }
-    }, SESSION_KEEPALIVE_INTERVAL);
+    keepAliveTimer = setTimeout(runKeepAliveLoop, getKeepAliveInterval());
+
+    // Watchdog-Heartbeat: tickt alle 30 s, damit lange geplante Pausen
+    // (Hauptschleife bis ~90 min, Keep-Alive bis 30 min) keinen falschen
+    // "Deadlock" auslösen. Prozess lebt = Timer tickt = Heartbeat frisch.
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+    }
+    heartbeatTimer = setInterval(() => {
+        if (!isShuttingDown) updateHeartbeat();
+    }, 30000);
 
     // Memory Check Timer
     if (memoryCheckTimer) {
@@ -1114,8 +1265,12 @@ function startTimers() {
 
 function stopTimers() {
     if (keepAliveTimer) {
-        clearInterval(keepAliveTimer);
+        clearTimeout(keepAliveTimer);
         keepAliveTimer = null;
+    }
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
     }
     if (memoryCheckTimer) {
         clearInterval(memoryCheckTimer);
@@ -1159,6 +1314,7 @@ async function start() {
 
         let datenVolumen = 0;
         let nextInterval = 300; // Default 5 Minuten
+        let statusMessage = null; // Status-Nachricht aus main()
 
         try {
             // Update-Check
@@ -1167,7 +1323,9 @@ async function start() {
             }
 
             // Hauptfunktion ausführen
-            datenVolumen = await main();
+            const mainResult = await main();
+            datenVolumen = mainResult.volumen;
+            statusMessage = mainResult.message;
 
             // Reset consecutive errors bei Erfolg
             if (datenVolumen > 0) {
@@ -1201,9 +1359,15 @@ async function start() {
             }
 
             if (datenVolumen !== 0) {
-                logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
-                logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
-                sendMessage(`📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`, "info");
+                // Beide Nachrichten in eine einzige Nachricht zusammenfassen
+                const nextCheckLine = `⏰ Nächste Prüfung in ${formatDuration(nextInterval * 1000)}`;
+                const combinedMessage = statusMessage
+                    ? `${statusMessage}\n${nextCheckLine}`
+                    : nextCheckLine;
+
+                // Log der exakt gesendeten Nachricht (vor dem Senden, Struktur wie die Message)
+                logger.info(combinedMessage);
+                sendMessage(combinedMessage, "info");
             } else {
                 logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
             }
